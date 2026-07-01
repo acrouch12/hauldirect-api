@@ -21,6 +21,11 @@ if (process.env.NODE_ENV !== "production") {
   require("dotenv").config();
 }
 
+// Fallback in case Railway doesn't inject the variable
+if (!process.env.FMCSA_API_KEY) {
+  process.env.FMCSA_API_KEY = "eeb7553869b3de8e716c28bd9a8fbedc7b7a02ed";
+}
+
 const app = express();
 app.use(express.json());
 
