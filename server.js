@@ -229,10 +229,15 @@ function mergeCarrierData(fmcsaResult, insuranceResult) {
     ? carrier?.bipdInsuranceOnFile === "Y"
     : true; // if not required, mark as active
 
-  // Dollar amounts come from SaferWatch/Highway — FMCSA has them but less structured.
-  // If you have SaferWatch data, swap these values.
-  const autoLiabilityCoverage = insuranceResult?.autoLiability ?? (insuranceOnFile ? 1000000 : 0);
-  const cargoCoverage = insuranceResult?.cargo ?? (insuranceOnFile ? 100000 : 0);
+  const insuranceOnFile = carrier?.bipdInsuranceRequired === "Y"
+    ? carrier?.bipdInsuranceOnFile === "Y"
+    : true;
+
+  // Parse coverage amounts — FMCSA returns these as strings, parse safely
+  const autoLiabilityCoverage = insuranceResult?.autoLiability
+    ?? (insuranceOnFile ? Number(carrier?.bipdRequiredAmount) || 750000 : 0);
+  const cargoCoverage = insuranceResult?.cargo
+    ?? (insuranceOnFile ? Number(carrier?.cargoInsuranceOnFile === "Y" ? 100000 : 0) : 0);
   const insuranceStatus = insuranceOnFile && rawAuth === "AUTHORIZED" ? "ACTIVE" : "LAPSED";
 
   return {
