@@ -50,35 +50,67 @@ const verifyLimiter = rateLimit({
 
 
 // ================================================================
-// CARRIER VERIFICATION ENDPOINT
+// CARRIER VERIFICATION ENDPOINT — Authority & Safety Ratings only
 // GET /api/carrier-verify?mc=123456&dot=1234567
-//
-// Called by the front-end's runCarrierOnboardingCheck() function.
-// Returns a unified shape regardless of which data source answered.
 // ================================================================
 app.get("/api/carrier-verify", verifyLimiter, async (req, res) => {
   const { mc, dot } = req.query;
-
   if (!mc && !dot) {
     return res.status(400).json({ error: "Provide at least one of: mc, dot" });
   }
-
   try {
-    // Step 1: Fetch from FMCSA QCMobile (free, covers authority + safety)
     const fmcsaData = await fetchFmcsa({ mc, dot });
-
-    // Step 2: Fetch insurance details from SaferWatch or Highway (paid add-on)
-    //         Comment this out until you have a SaferWatch/Highway account.
-    //         The FMCSA data alone will still give you authority + safety rating.
-    // const insuranceData = await fetchSaferWatch({ mc, dot });
-
-    // Step 3: Merge into the unified shape the front-end already understands
-    const result = mergeCarrierData(fmcsaData, null /* insuranceData */);
-
-    return res.json(result);
+    const result = mergeCarrierData(fmcsaData, null);
+    // Return authority + safety only — no insurance fields
+    return res.json({
+      legalName: result.legalName,
+      dotNumber: result.dotNumber,
+      mcNumber: result.mcNumber,
+      authorityStatus: result.authorityStatus,
+      safetyRating: result.safetyRating,
+      oosRateVehicle: result.oosRateVehicle,
+      oosRateDriver: result.oosRateDriver,
+      crashCount24mo: result.crashCount24mo,
+    });
   } catch (err) {
     console.error("Carrier verify error:", err.message);
-    return res.status(500).json({ error: "Verification service unavailable — try again shortly." });
+    return res.status(500).json({ error: err.message || "Verification service unavailable" });
+  }
+});
+
+
+// ================================================================
+// INSURANCE VERIFICATION ENDPOINT — Separate route
+// GET /api/insurance-verify?mc=123456&dot=1234567
+//
+// Currently reads FMCSA's own insurance fields.
+// Plug SaferWatch or Highway in here for real dollar amounts.
+// ================================================================
+app.get("/api/insurance-verify", verifyLimiter, async (req, res) => {
+  const { mc, dot } = req.query;
+  if (!mc && !dot) {
+    return res.status(400).json({ error: "Provide at least one of: mc, dot" });
+  }
+  try {
+    const fmcsaData = await fetchFmcsa({ mc, dot });
+    const result = mergeCarrierData(fmcsaData, null);
+    return res.json({
+      legalName: result.legalName,
+      dotNumber: result.dotNumber,
+      mcNumber: result.mcNumber,
+      insuranceStatus: result.insuranceStatus,
+      autoLiabilityCoverage: result.autoLiabilityCoverage,
+      cargoCoverage: result.cargoCoverage,
+      // When you add SaferWatch/Highway, extra fields like policyNumber,
+      // insurer name, and expiry date will come back here too
+      dataSource: process.env.SAFERWATCH_API_KEY ? "SaferWatch" : "FMCSA",
+      note: process.env.SAFERWATCH_API_KEY
+        ? "Live insurance data from SaferWatch"
+        : "Insurance data from FMCSA public records — add SaferWatch for real-time COI verification",
+    });
+  } catch (err) {
+    console.error("Insurance verify error:", err.message);
+    return res.status(500).json({ error: err.message || "Insurance verification service unavailable" });
   }
 });
 
