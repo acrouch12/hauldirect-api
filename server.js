@@ -15,7 +15,11 @@
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
-require("dotenv").config();
+
+// Only load .env file in local development — Railway injects variables directly
+if (process.env.NODE_ENV !== "production") {
+  require("dotenv").config();
+}
 
 const app = express();
 app.use(express.json());
@@ -25,7 +29,7 @@ app.use(express.json());
 // ----------------------------------------------------------------
 app.use(
   cors({
-    origin: process.env.ALLOWED_ORIGIN || "http://localhost:3000",
+    origin: "*",
     methods: ["GET", "POST"],
   })
 );
