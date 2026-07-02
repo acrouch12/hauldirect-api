@@ -607,6 +607,81 @@ app.get("/api/tracking/status/:loadId", (req, res) => {
   res.json({ loadId: record.loadId, tracked: true, arrivalAt: record.arrivalAt, departureAt: record.departureAt, detentionMinutes: detention.billMin, detentionAmount: detention.amount, charged: record.charged });
 });
 
+
+// ================================================================
+// DISPUTES ENDPOINTS
+// ================================================================
+
+// POST /api/disputes
+app.post("/api/disputes", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("disputes").insert({
+      id:             crypto.randomUUID(),
+      load_id:        req.body.loadId,
+      filed_by:       req.body.filedBy,
+      filed_by_name:  req.body.filedByName,
+      filed_by_role:  req.body.filedByRole,
+      against_id:     req.body.againstId,
+      against_name:   req.body.againstName,
+      type:           req.body.type,
+      description:    req.body.description,
+      status:         "open",
+      created_at:     new Date().toISOString(),
+    }).select().single();
+    if (error) throw error;
+    res.json({ dispute: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/disputes
+app.get("/api/disputes", async (req, res) => {
+  try {
+    const { data } = await supabase.from("disputes").select("*").order("created_at", { ascending: false });
+    res.json({ disputes: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/disputes/:id
+app.patch("/api/disputes/:id", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("disputes").update({ ...req.body, updated_at: new Date().toISOString() }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ dispute: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// SAFERWATCH INSURANCE MONITORING
+// When you get a SaferWatch API key, set SAFERWATCH_API_KEY in
+// Railway env vars and this endpoint will return real-time data.
+// ================================================================
+app.get("/api/insurance-monitor/:dotNumber", async (req, res) => {
+  const key = process.env.SAFERWATCH_API_KEY;
+  if (!key) {
+    return res.json({
+      monitored: false,
+      message: "SaferWatch not configured — add SAFERWATCH_API_KEY to Railway environment variables",
+      dotNumber: req.params.dotNumber,
+    });
+  }
+  try {
+    const resp = await fetch(`https://api.saferwatch.com/v1/carrier/${req.params.dotNumber}`, {
+      headers: { "Authorization": `Bearer ${key}`, "Content-Type": "application/json" },
+    });
+    if (!resp.ok) throw new Error(`SaferWatch error ${resp.status}`);
+    const data = await resp.json();
+    res.json({ monitored: true, ...data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // STRIPE WEBHOOK STUB
 // ================================================================
