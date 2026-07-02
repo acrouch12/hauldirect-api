@@ -1,359 +1,644 @@
 /**
  * HaulDirect Backend Server
- * Node.js + Express
+ * Node.js + Express + Supabase
  *
  * Handles:
  *  - Carrier verification via FMCSA QCMobile API
- *  - Insurance status (mock structure — plug SaferWatch/Highway in here)
- *  - Stripe subscription webhooks (stub)
- *  - JWT session auth (stub)
- *
- * FMCSA QCMobile API docs: https://ai.fmcsa.dot.gov/SMS/Tools/Downloads.aspx
- * Register for a free API key at: https://ai.fmcsa.dot.gov/
+ *  - All database reads/writes via Supabase
+ *  - User auth (signup, login, session)
+ *  - Loads, bids, messages, documents
+ *  - Stripe webhooks (stub — wire in when keys are ready)
+ *  - Detention tracking with geofencing
  */
 
 const express = require("express");
-const cors = require("cors");
+const cors    = require("cors");
 const rateLimit = require("express-rate-limit");
+const { createClient } = require("@supabase/supabase-js");
 
-// Only load .env file in local development — Railway injects variables directly
-if (process.env.NODE_ENV !== "production") {
-  require("dotenv").config();
-}
+if (process.env.NODE_ENV !== "production") require("dotenv").config();
 
-// Fallback in case Railway doesn't inject the variable
-if (!process.env.FMCSA_API_KEY) {
-  process.env.FMCSA_API_KEY = "eeb7553869b3de8e716c28bd9a8fbedc7b7a02ed";
-}
+// ── Hardcoded fallbacks so Railway never fails silently ──
+if (!process.env.FMCSA_API_KEY)    process.env.FMCSA_API_KEY    = "eeb7553869b3de8e716c28bd9a8fbedc7b7a02ed";
+if (!process.env.SUPABASE_URL)     process.env.SUPABASE_URL     = "https://qvusaeareoylwgkqfluw.supabase.co";
+if (!process.env.SUPABASE_ANON_KEY) process.env.SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF2dXNhZWFyZW95bHdna3FmbHV3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NDYxMjYsImV4cCI6MjA5ODUyMjEyNn0.e7gdCeSj-yes_NuxWQDgCso0YHVZeaQlgVcC8aRH3jA";
 
-const app = express();
-app.use(express.json());
-
-// ----------------------------------------------------------------
-// CORS — in production, restrict this to your actual domain only
-// ----------------------------------------------------------------
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST"],
-  })
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_ANON_KEY
 );
 
-// ----------------------------------------------------------------
-// Rate limiting — prevents abuse of the FMCSA API key
-// ----------------------------------------------------------------
-const verifyLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 30, // max 30 verification requests per IP per window
-  message: { error: "Too many verification requests — try again in 15 minutes." },
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "PATCH"] }));
+
+const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
+
+// ================================================================
+// DATABASE HELPERS
+// ================================================================
+const db = {
+  // ── USERS ──
+  async createUser(user) {
+    const { data, error } = await supabase.from("users").insert(user).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async getUserByEmail(email) {
+    const { data } = await supabase.from("users").select("*").eq("email", email.toLowerCase()).single();
+    return data;
+  },
+  async getUserById(id) {
+    const { data } = await supabase.from("users").select("*").eq("id", id).single();
+    return data;
+  },
+  async updateUser(id, updates) {
+    const { data, error } = await supabase.from("users").update(updates).eq("id", id).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async getAllUsers() {
+    const { data } = await supabase.from("users").select("*").order("created_at", { ascending: false });
+    return data || [];
+  },
+
+  // ── LOADS ──
+  async createLoad(load) {
+    const { data, error } = await supabase.from("loads").insert(load).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async getLoads(filters = {}) {
+    let q = supabase.from("loads").select("*").order("posted_at", { ascending: false });
+    if (filters.status)     q = q.eq("status", filters.status);
+    if (filters.shipper_id) q = q.eq("shipper_id", filters.shipper_id);
+    if (filters.carrier_id) q = q.eq("carrier_id", filters.carrier_id);
+    const { data } = await q;
+    return data || [];
+  },
+  async getLoadById(id) {
+    const { data } = await supabase.from("loads").select("*").eq("id", id).single();
+    return data;
+  },
+  async updateLoad(id, updates) {
+    const { data, error } = await supabase.from("loads").update(updates).eq("id", id).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async deleteLoad(id) {
+    const { error } = await supabase.from("loads").delete().eq("id", id);
+    if (error) throw error;
+  },
+
+  // ── BIDS ──
+  async createBid(bid) {
+    const { data, error } = await supabase.from("bids").insert(bid).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async getBidsForLoad(loadId) {
+    const { data } = await supabase.from("bids").select("*").eq("load_id", loadId).order("created_at");
+    return data || [];
+  },
+  async updateBid(id, updates) {
+    const { data, error } = await supabase.from("bids").update(updates).eq("id", id).select().single();
+    if (error) throw error;
+    return data;
+  },
+
+  // ── MESSAGES ──
+  async sendMessage(msg) {
+    const { data, error } = await supabase.from("messages").insert(msg).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async getMessages(loadId, carrierId) {
+    const { data } = await supabase.from("messages")
+      .select("*").eq("load_id", loadId).eq("carrier_id", carrierId)
+      .order("sent_at");
+    return data || [];
+  },
+
+  // ── DOCUMENTS ──
+  async saveDocument(doc) {
+    const { data, error } = await supabase.from("documents").insert(doc).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async getDocumentsForLoad(loadId) {
+    const { data } = await supabase.from("documents").select("*").eq("load_id", loadId).order("uploaded_at");
+    return data || [];
+  },
+
+  // ── RATINGS ──
+  async saveRating(rating) {
+    const { data, error } = await supabase.from("ratings").insert(rating).select().single();
+    if (error) throw error;
+    return data;
+  },
+  async getRatingsForUser(userId) {
+    const { data } = await supabase.from("ratings").select("*").eq("rated_user_id", userId);
+    return data || [];
+  },
+};
+
+// ================================================================
+// AUTH ENDPOINTS
+// ================================================================
+
+// POST /api/auth/signup
+app.post("/api/auth/signup", async (req, res) => {
+  try {
+    const { name, email, role, company, equipmentType, truckDesc, maxWeight,
+            dotNumber, mcNumber, verification, coiVerified, coiData,
+            bizVerified, bizData, stripeConnected, payout, billing,
+            loc, dims, lanes, eld, equipmentStatus, currentZip } = req.body;
+
+    if (!name || !email || !role) return res.status(400).json({ error: "name, email, role required" });
+
+    const existing = await db.getUserByEmail(email);
+    if (existing) return res.status(409).json({ error: "An account with that email already exists." });
+
+    const user = await db.createUser({
+      id:               crypto.randomUUID(),
+      name,
+      email:            email.toLowerCase(),
+      role,
+      company:          company || null,
+      equipment_type:   equipmentType || null,
+      truck_desc:       truckDesc || null,
+      max_weight:       maxWeight || null,
+      dims:             dims || null,
+      dot_number:       dotNumber || null,
+      mc_number:        mcNumber || null,
+      verification:     verification || null,
+      coi_verified:     coiVerified || false,
+      coi_data:         coiData || null,
+      biz_verified:     bizVerified || false,
+      biz_data:         bizData || null,
+      stripe_connected: stripeConnected || false,
+      payout:           payout || null,
+      billing:          billing || null,
+      loc:              loc || null,
+      lanes:            lanes || [],
+      eld:              eld || null,
+      equipment_status: equipmentStatus || "empty",
+      current_zip:      currentZip || null,
+      ratings:          [],
+      suspended:        false,
+      created_at:       new Date().toISOString(),
+    });
+
+    res.json({ user });
+  } catch (err) {
+    console.error("Signup error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
+// POST /api/auth/login
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "email required" });
+    const user = await db.getUserByEmail(email);
+    if (!user) return res.status(404).json({ error: "No account found with that email." });
+    if (user.suspended) return res.status(403).json({ error: "This account has been suspended. Contact support." });
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/auth/user/:id
+app.get("/api/auth/user/:id", async (req, res) => {
+  try {
+    const user = await db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/auth/user/:id
+app.patch("/api/auth/user/:id", async (req, res) => {
+  try {
+    const user = await db.updateUser(req.params.id, req.body);
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ================================================================
-// CARRIER VERIFICATION ENDPOINT — Authority & Safety Ratings only
-// GET /api/carrier-verify?mc=123456&dot=1234567
+// LOADS ENDPOINTS
 // ================================================================
+
+// POST /api/loads
+app.post("/api/loads", async (req, res) => {
+  try {
+    const load = await db.createLoad({
+      id:           crypto.randomUUID(),
+      shipper_id:   req.body.shipperId,
+      shipper_name: req.body.shipperName,
+      status:       "open",
+      carrier_id:   null,
+      progress:     0,
+      posted_at:    new Date().toISOString(),
+      paid:         false,
+      ...req.body,
+    });
+    res.json({ load });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/loads
+app.get("/api/loads", async (req, res) => {
+  try {
+    const loads = await db.getLoads(req.query);
+    res.json({ loads });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/loads/:id
+app.get("/api/loads/:id", async (req, res) => {
+  try {
+    const load = await db.getLoadById(req.params.id);
+    if (!load) return res.status(404).json({ error: "Load not found" });
+    res.json({ load });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/loads/:id
+app.patch("/api/loads/:id", async (req, res) => {
+  try {
+    const load = await db.updateLoad(req.params.id, req.body);
+    res.json({ load });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/loads/:id  (operator only)
+app.delete("/api/loads/:id", async (req, res) => {
+  try {
+    await db.deleteLoad(req.params.id);
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// BIDS ENDPOINTS
+// ================================================================
+
+// POST /api/loads/:id/bids
+app.post("/api/loads/:id/bids", async (req, res) => {
+  try {
+    const bid = await db.createBid({
+      id:         crypto.randomUUID(),
+      load_id:    req.params.id,
+      carrier_id: req.body.carrierId,
+      amount:     req.body.amount,
+      note:       req.body.note || null,
+      status:     "pending",
+      created_at: new Date().toISOString(),
+    });
+    res.json({ bid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/loads/:id/bids
+app.get("/api/loads/:id/bids", async (req, res) => {
+  try {
+    const bids = await db.getBidsForLoad(req.params.id);
+    res.json({ bids });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/bids/:id
+app.patch("/api/bids/:id", async (req, res) => {
+  try {
+    const bid = await db.updateBid(req.params.id, req.body);
+    res.json({ bid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// MESSAGES ENDPOINTS
+// ================================================================
+
+// POST /api/messages
+app.post("/api/messages", async (req, res) => {
+  try {
+    const msg = await db.sendMessage({
+      id:         crypto.randomUUID(),
+      load_id:    req.body.loadId,
+      carrier_id: req.body.carrierId,
+      sender_id:  req.body.senderId,
+      role:       req.body.role,
+      name:       req.body.name,
+      text:       req.body.text,
+      sent_at:    new Date().toISOString(),
+    });
+    res.json({ message: msg });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/messages/:loadId/:carrierId
+app.get("/api/messages/:loadId/:carrierId", async (req, res) => {
+  try {
+    const messages = await db.getMessages(req.params.loadId, req.params.carrierId);
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// DOCUMENTS ENDPOINTS
+// ================================================================
+
+// POST /api/documents
+app.post("/api/documents", async (req, res) => {
+  try {
+    const doc = await db.saveDocument({
+      id:              crypto.randomUUID(),
+      load_id:         req.body.loadId,
+      uploaded_by:     req.body.uploadedBy,
+      uploaded_by_name: req.body.uploadedByName,
+      type:            req.body.type,
+      filename:        req.body.filename,
+      mime_type:       req.body.mimeType,
+      size_bytes:      req.body.sizeBytes,
+      data_url:        req.body.dataUrl,
+      uploaded_at:     new Date().toISOString(),
+    });
+    res.json({ document: doc });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/documents/:loadId
+app.get("/api/documents/:loadId", async (req, res) => {
+  try {
+    const documents = await db.getDocumentsForLoad(req.params.loadId);
+    res.json({ documents });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// RATINGS ENDPOINTS
+// ================================================================
+
+// POST /api/ratings
+app.post("/api/ratings", async (req, res) => {
+  try {
+    const rating = await db.saveRating({
+      id:             crypto.randomUUID(),
+      load_id:        req.body.loadId,
+      rated_user_id:  req.body.ratedUserId,
+      rater_user_id:  req.body.raterUserId,
+      stars:          req.body.stars,
+      role:           req.body.role,
+      created_at:     new Date().toISOString(),
+    });
+    // Update user's ratings array
+    const ratings = await db.getRatingsForUser(req.body.ratedUserId);
+    await db.updateUser(req.body.ratedUserId, {
+      ratings: ratings.map((r) => r.stars),
+    });
+    res.json({ rating });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// OPERATOR ENDPOINTS
+// ================================================================
+
+// GET /api/operator/users  (all users for operator dashboard)
+app.get("/api/operator/users", async (req, res) => {
+  try {
+    const users = await db.getAllUsers();
+    res.json({ users });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/operator/users/:id/suspend
+app.patch("/api/operator/users/:id/suspend", async (req, res) => {
+  try {
+    const user = await db.updateUser(req.params.id, { suspended: req.body.suspended });
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/operator/users/:id
+app.delete("/api/operator/users/:id", async (req, res) => {
+  try {
+    const { error } = await supabase.from("users").delete().eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// FMCSA CARRIER VERIFICATION
+// ================================================================
+const FREE_WINDOW_MS     = 2 * 60 * 60 * 1000;
+const DETENTION_RATE_HR  = 60;
+const INCREMENT_MIN      = 15;
+const GEOFENCE_RADIUS_MI = 1.0;
+const detentionStore     = {};
+
+function haversineMilesServer(lat1, lng1, lat2, lng2) {
+  const R = 3958.8;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) *
+    Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function calcDetention(arrivalAt, departureAt) {
+  const dwellMs  = (departureAt || Date.now()) - arrivalAt;
+  const overMs   = Math.max(0, dwellMs - FREE_WINDOW_MS);
+  const billMin  = Math.ceil((overMs / 60000) / INCREMENT_MIN) * INCREMENT_MIN;
+  const amount   = parseFloat(((billMin / 60) * DETENTION_RATE_HR).toFixed(2));
+  return { dwellMs, billMin, amount };
+}
+
 app.get("/api/carrier-verify", verifyLimiter, async (req, res) => {
   const { mc, dot } = req.query;
-  if (!mc && !dot) {
-    return res.status(400).json({ error: "Provide at least one of: mc, dot" });
-  }
+  if (!mc && !dot) return res.status(400).json({ error: "Provide mc or dot" });
   try {
     const fmcsaData = await fetchFmcsa({ mc, dot });
-    const result = mergeCarrierData(fmcsaData, null);
-    // Return authority + safety only — no insurance fields
-    return res.json({
-      legalName: result.legalName,
-      dotNumber: result.dotNumber,
-      mcNumber: result.mcNumber,
-      authorityStatus: result.authorityStatus,
-      safetyRating: result.safetyRating,
-      oosRateVehicle: result.oosRateVehicle,
-      oosRateDriver: result.oosRateDriver,
-      crashCount24mo: result.crashCount24mo,
-    });
+    res.json(mergeCarrierData(fmcsaData, null));
   } catch (err) {
-    console.error("Carrier verify error:", err.message);
-    return res.status(500).json({ error: err.message || "Verification service unavailable" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-
-// ================================================================
-// INSURANCE VERIFICATION ENDPOINT — Separate route
-// GET /api/insurance-verify?mc=123456&dot=1234567
-//
-// Currently reads FMCSA's own insurance fields.
-// Plug SaferWatch or Highway in here for real dollar amounts.
-// ================================================================
 app.get("/api/insurance-verify", verifyLimiter, async (req, res) => {
   const { mc, dot } = req.query;
-  if (!mc && !dot) {
-    return res.status(400).json({ error: "Provide at least one of: mc, dot" });
-  }
+  if (!mc && !dot) return res.status(400).json({ error: "Provide mc or dot" });
   try {
     const fmcsaData = await fetchFmcsa({ mc, dot });
     const result = mergeCarrierData(fmcsaData, null);
-    return res.json({
-      legalName: result.legalName,
-      dotNumber: result.dotNumber,
-      mcNumber: result.mcNumber,
+    res.json({
+      legalName: result.legalName, dotNumber: result.dotNumber, mcNumber: result.mcNumber,
       insuranceStatus: result.insuranceStatus,
       autoLiabilityCoverage: result.autoLiabilityCoverage,
       cargoCoverage: result.cargoCoverage,
-      // When you add SaferWatch/Highway, extra fields like policyNumber,
-      // insurer name, and expiry date will come back here too
-      dataSource: process.env.SAFERWATCH_API_KEY ? "SaferWatch" : "FMCSA",
-      note: process.env.SAFERWATCH_API_KEY
-        ? "Live insurance data from SaferWatch"
-        : "Insurance data from FMCSA public records — add SaferWatch for real-time COI verification",
+      dataSource: "FMCSA",
+      note: "Insurance data from FMCSA public records — add SaferWatch for real-time COI verification",
     });
   } catch (err) {
-    console.error("Insurance verify error:", err.message);
-    return res.status(500).json({ error: err.message || "Insurance verification service unavailable" });
+    res.status(500).json({ error: err.message });
   }
 });
 
-
-// ================================================================
-// FMCSA QCMobile API
-// Docs: https://ai.fmcsa.dot.gov/SMS/Tools/Downloads.aspx
-// Free key registration: https://ai.fmcsa.dot.gov/
-// ================================================================
 async function fetchFmcsa({ mc, dot }) {
   const key = process.env.FMCSA_API_KEY;
-  if (!key) throw new Error("FMCSA_API_KEY not set in .env file");
-
+  if (!key) throw new Error("FMCSA_API_KEY not set");
   let dotNumber = dot;
-  if (!dotNumber && mc) {
-    dotNumber = await resolveMcToDot(mc, key);
-  }
-  if (!dotNumber) throw new Error("Could not resolve a DOT number from the MC number provided — confirm the MC number is correct");
-
-  const carrierUrl =
-    `https://mobile.fmcsa.dot.gov/qc/services/carriers/${dotNumber}?webKey=${key}`;
-  const carrierResp = await fetch(carrierUrl);
-
-  if (carrierResp.status === 401 || carrierResp.status === 403) {
-    throw new Error("FMCSA API key rejected — confirm the key in your .env file is correct");
-  }
-  if (carrierResp.status === 404) {
-    throw new Error("No carrier found for that DOT/MC number in the FMCSA database");
-  }
-  if (!carrierResp.ok) {
-    throw new Error(`FMCSA carrier lookup failed with status ${carrierResp.status}`);
-  }
-
+  if (!dotNumber && mc) dotNumber = await resolveMcToDot(mc, key);
+  if (!dotNumber) throw new Error("Could not resolve DOT number from MC number provided");
+  const carrierResp = await fetch(`https://mobile.fmcsa.dot.gov/qc/services/carriers/${dotNumber}?webKey=${key}`);
+  if (carrierResp.status === 401 || carrierResp.status === 403) throw new Error("FMCSA API key rejected");
+  if (carrierResp.status === 404) throw new Error("No carrier found for that DOT/MC number");
+  if (!carrierResp.ok) throw new Error(`FMCSA error ${carrierResp.status}`);
   const carrierJson = await carrierResp.json();
   const carrier = carrierJson?.content?.carrier;
-  if (!carrier) throw new Error("FMCSA returned a response but no carrier data — the MC/DOT may not be registered");
-
-  // Safety BASICS (crash data, OOS rates) — optional, don't fail without it
-  const safetyUrl =
-    `https://mobile.fmcsa.dot.gov/qc/services/carriers/${dotNumber}/basics?webKey=${key}`;
+  if (!carrier) throw new Error("FMCSA returned no carrier data");
   let safetyJson = null;
   try {
-    const safetyResp = await fetch(safetyUrl);
-    if (safetyResp.ok) safetyJson = await safetyResp.json();
-  } catch (_) {
-    // Safety record unavailable — continue with carrier basics only
-  }
-
+    const sr = await fetch(`https://mobile.fmcsa.dot.gov/qc/services/carriers/${dotNumber}/basics?webKey=${key}`);
+    if (sr.ok) safetyJson = await sr.json();
+  } catch (_) {}
   return { carrier, safety: safetyJson?.content, dotNumber };
 }
 
 async function resolveMcToDot(mc, key) {
-  // Strip non-digits, strip leading "MC" prefix
   const mcNum = mc.replace(/\D/g, "");
-  const url =
-    `https://mobile.fmcsa.dot.gov/qc/services/carriers/docket-number/${mcNum}?webKey=${key}`;
-  const resp = await fetch(url);
+  const resp = await fetch(`https://mobile.fmcsa.dot.gov/qc/services/carriers/docket-number/${mcNum}?webKey=${key}`);
   if (!resp.ok) return null;
   const json = await resp.json();
   return json?.content?.carrier?.dotNumber || null;
 }
 
-
-// ================================================================
-// SaferWatch API (paid — plug in when you have credentials)
-// Contact: https://www.saferwatch.com/integrations
-// ================================================================
-async function fetchSaferWatch({ mc, dot }) {
-  const key = process.env.SAFERWATCH_API_KEY;
-  if (!key) return null; // Gracefully skip if not configured
-
-  // SaferWatch's endpoint structure — verify exact URL with their team on signup:
-  const query = mc
-    ? `mcNumber=${mc.replace(/\D/g, "")}`
-    : `dotNumber=${dot}`;
-  const url = `https://api.saferwatch.com/carrier?${query}`;
-  const resp = await fetch(url, {
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-  });
-  if (!resp.ok) return null;
-  return resp.json();
-}
-
-
-// ================================================================
-// Merge FMCSA + optional insurance data into the unified shape
-// the HaulDirect front-end already expects
-// ================================================================
 function mergeCarrierData(fmcsaResult, insuranceResult) {
   const { carrier, safety, dotNumber } = fmcsaResult;
-
-  // Map FMCSA authority status to our three-state model
-  const rawAuth = carrier?.allowedToOperate === "Y"
-    ? "AUTHORIZED"
-    : carrier?.statusCode === "R"
-      ? "REVOKED"
-      : "NOT AUTHORIZED";
-
-  // FMCSA safety rating field
+  const rawAuth = carrier?.allowedToOperate === "Y" ? "AUTHORIZED" : carrier?.statusCode === "R" ? "REVOKED" : "NOT AUTHORIZED";
   const rawRating = carrier?.safetyRating?.toUpperCase?.() || "NOT RATED";
-  const safetyRating = ["SATISFACTORY", "CONDITIONAL", "UNSATISFACTORY"].includes(rawRating)
-    ? rawRating
-    : "NOT RATED";
-
-  // OOS rates from the BASICS data (if available)
-  const vehicleOOS = safety?.vehicleInspectionOosRate ?? null;
-  const driverOOS = safety?.driverInspectionOosRate ?? null;
-  const crashCount = safety?.crashTotal ?? 0;
-
-  // Insurance data from SaferWatch (or FMCSA's own fields if available)
-  // FMCSA does carry some insurance flags — insuranceRequired / insuranceOnFile
-  const insuranceOnFile = carrier?.bipdInsuranceRequired === "Y"
-    ? carrier?.bipdInsuranceOnFile === "Y"
-    : true; // if not required, mark as active
-
-  const insuranceOnFile = carrier?.bipdInsuranceRequired === "Y"
-    ? carrier?.bipdInsuranceOnFile === "Y"
-    : true;
-
-  // Parse coverage amounts — FMCSA returns these as strings, parse safely
-  const autoLiabilityCoverage = insuranceResult?.autoLiability
-    ?? (insuranceOnFile ? Number(carrier?.bipdRequiredAmount) || 750000 : 0);
-  const cargoCoverage = insuranceResult?.cargo
-    ?? (insuranceOnFile ? Number(carrier?.cargoInsuranceOnFile === "Y" ? 100000 : 0) : 0);
-  const insuranceStatus = insuranceOnFile && rawAuth === "AUTHORIZED" ? "ACTIVE" : "LAPSED";
-
+  const safetyRating = ["SATISFACTORY", "CONDITIONAL", "UNSATISFACTORY"].includes(rawRating) ? rawRating : "NOT RATED";
+  const insuranceOnFile = carrier?.bipdInsuranceRequired === "Y" ? carrier?.bipdInsuranceOnFile === "Y" : true;
+  const autoLiabilityCoverage = insuranceResult?.autoLiability ?? (insuranceOnFile ? Number(carrier?.bipdRequiredAmount) || 750000 : 0);
+  const cargoCoverage = insuranceResult?.cargo ?? (insuranceOnFile ? Number(carrier?.cargoInsuranceOnFile === "Y" ? 100000 : 0) : 0);
   return {
-    // Identity
     legalName: carrier?.legalName || carrier?.dbaName || "Unknown",
     dotNumber: String(dotNumber || carrier?.dotNumber || ""),
     mcNumber: carrier?.mcNumber ? `MC-${carrier.mcNumber}` : null,
-
-    // Authority
     authorityStatus: rawAuth,
-
-    // Safety
     safetyRating,
-    oosRateVehicle: vehicleOOS !== null ? Math.round(vehicleOOS * 100) / 100 : 0,
-    oosRateDriver: driverOOS !== null ? Math.round(driverOOS * 100) / 100 : 0,
-    crashCount24mo: crashCount,
-
-    // Insurance
-    insuranceStatus,
+    oosRateVehicle: Math.round((safety?.vehicleInspectionOosRate ?? 0) * 100) / 100,
+    oosRateDriver: Math.round((safety?.driverInspectionOosRate ?? 0) * 100) / 100,
+    crashCount24mo: safety?.crashTotal ?? 0,
+    insuranceStatus: insuranceOnFile && rawAuth === "AUTHORIZED" ? "ACTIVE" : "LAPSED",
     autoLiabilityCoverage,
     cargoCoverage,
   };
 }
 
+// Detention tracking
+app.post("/api/tracking/ping", async (req, res) => {
+  const { loadId, carrierId, lat, lng, facilityLat, facilityLng } = req.body;
+  if (!loadId || lat == null || lng == null || facilityLat == null || facilityLng == null)
+    return res.status(400).json({ error: "loadId, lat, lng, facilityLat, facilityLng required" });
+  const now = Date.now();
+  const distMiles = haversineMilesServer(lat, lng, facilityLat, facilityLng);
+  const insideGeofence = distMiles <= GEOFENCE_RADIUS_MI;
+  let record = detentionStore[loadId];
+  if (insideGeofence && !record) {
+    record = { loadId, carrierId, facilityLat, facilityLng, arrivalAt: now, departureAt: null, charged: false };
+    detentionStore[loadId] = record;
+  }
+  if (!insideGeofence && record && !record.departureAt) {
+    record.departureAt = now;
+    const { amount } = calcDetention(record.arrivalAt, now);
+    record.detentionAmount = amount;
+    record.charged = amount > 0;
+  }
+  const detention = record ? calcDetention(record.arrivalAt, record.departureAt || now) : null;
+  res.json({ loadId, distMiles: parseFloat(distMiles.toFixed(3)), insideGeofence, arrivalAt: record?.arrivalAt || null, departureAt: record?.departureAt || null, freeWindowExpired: record ? (now - record.arrivalAt) > FREE_WINDOW_MS : false, detentionActive: record && !record.departureAt && (now - record.arrivalAt) > FREE_WINDOW_MS, detentionMinutes: detention?.billMin || 0, detentionAmount: detention?.amount || 0, charged: record?.charged || false });
+});
+
+app.get("/api/tracking/status/:loadId", (req, res) => {
+  const record = detentionStore[req.params.loadId];
+  if (!record) return res.json({ loadId: req.params.loadId, tracked: false });
+  const detention = calcDetention(record.arrivalAt, record.departureAt || Date.now());
+  res.json({ loadId: record.loadId, tracked: true, arrivalAt: record.arrivalAt, departureAt: record.departureAt, detentionMinutes: detention.billMin, detentionAmount: detention.amount, charged: record.charged });
+});
 
 // ================================================================
 // STRIPE WEBHOOK STUB
-// POST /api/webhooks/stripe
-//
-// Wire this up when you add Stripe Billing for subscriptions.
-// Set your webhook secret in .env as STRIPE_WEBHOOK_SECRET.
 // ================================================================
-app.post(
-  "/api/webhooks/stripe",
-  express.raw({ type: "application/json" }), // Stripe requires raw body
-  (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    const secret = process.env.STRIPE_WEBHOOK_SECRET;
-
-    // Uncomment when you add the stripe npm package:
-    // const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-    // let event;
-    // try {
-    //   event = stripe.webhooks.constructEvent(req.body, sig, secret);
-    // } catch (err) {
-    //   return res.status(400).send(`Webhook signature error: ${err.message}`);
-    // }
-    //
-    // switch (event.type) {
-    //   case "customer.subscription.deleted":
-    //     // Lock account in your DB
-    //     break;
-    //   case "invoice.payment_failed":
-    //     // Send dunning email, set account to past_due
-    //     break;
-    //   case "customer.subscription.updated":
-    //     // Update tier in your DB
-    //     break;
-    // }
-
-    console.log("Stripe webhook received (stub) — wire up Stripe SDK to process events");
-    res.json({ received: true });
-  }
-);
-
+app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), (req, res) => {
+  console.log("Stripe webhook received — wire up Stripe SDK to process events");
+  res.json({ received: true });
+});
 
 // ================================================================
 // HEALTH CHECK
-// GET /api/health
-// Visit http://localhost:4000/api/health to confirm everything is wired up
 // ================================================================
-app.get("/api/health", (req, res) => {
+app.get("/api/health", async (req, res) => {
+  let dbConnected = false;
+  try {
+    const { error } = await supabase.from("users").select("id").limit(1);
+    dbConnected = !error;
+  } catch (_) {}
   res.json({
     status: "ok",
     fmcsaKeyConfigured: !!process.env.FMCSA_API_KEY,
-    fmcsaKeyPrefix: process.env.FMCSA_API_KEY
-      ? process.env.FMCSA_API_KEY.slice(0, 6) + "…"
-      : "NOT SET",
-    saferwatchKeyConfigured: !!process.env.SAFERWATCH_API_KEY,
+    supabaseConfigured: !!process.env.SUPABASE_URL,
+    databaseConnected: dbConnected,
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
   });
 });
 
-
-// ================================================================
-// START SERVER
-// ================================================================
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  console.log("");
-  console.log("╔══════════════════════════════════════════╗");
-  console.log("║       HaulDirect API Server              ║");
-  console.log(`║       Running on port ${PORT}                ║`);
-  console.log("╚══════════════════════════════════════════╝");
-  console.log("");
-
-  if (process.env.FMCSA_API_KEY) {
-    console.log(`✅  FMCSA key loaded: ${process.env.FMCSA_API_KEY.slice(0, 6)}…`);
-    console.log(`    Test it: http://localhost:${PORT}/api/carrier-verify?mc=123456`);
-  } else {
-    console.log("❌  FMCSA_API_KEY not set — check your .env file");
-  }
-
-  if (process.env.SAFERWATCH_API_KEY) {
-    console.log("✅  SaferWatch key loaded");
-  } else {
-    console.log("⚠️   SaferWatch key not set (optional — insurance $ amounts will be estimated)");
-  }
-
-  if (process.env.STRIPE_SECRET_KEY) {
-    console.log("✅  Stripe key loaded");
-  } else {
-    console.log("⚠️   Stripe key not set (optional — needed for subscriptions/QuickPay)");
-  }
-
-  console.log("");
-  console.log(`Health check: http://localhost:${PORT}/api/health`);
-  console.log("");
+  console.log(`\n╔══════════════════════════════════════╗`);
+  console.log(`║   HaulDirect API — port ${PORT}         ║`);
+  console.log(`╚══════════════════════════════════════╝\n`);
+  console.log(`✅  FMCSA key:    ${process.env.FMCSA_API_KEY ? process.env.FMCSA_API_KEY.slice(0,6) + "…" : "NOT SET"}`);
+  console.log(`✅  Supabase URL: ${process.env.SUPABASE_URL}`);
+  console.log(`\nHealth: http://localhost:${PORT}/api/health\n`);
 });
