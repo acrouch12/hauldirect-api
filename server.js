@@ -691,7 +691,7 @@ const WAITLIST_PROMO_LIMIT = 100;
 const WAITLIST_DISCOUNT    = 30; // 30% off
 
 function generatePromoCode(position) {
-  return \`EARLY\${String(position).padStart(3,"0")}\`;
+  return `EARLY${String(position).padStart(3,"0")}`;
 }
 
 // POST /api/waitlist
