@@ -682,6 +682,96 @@ app.get("/api/insurance-monitor/:dotNumber", async (req, res) => {
   }
 });
 
+
+// ================================================================
+// WAITLIST ENDPOINTS
+// First 100 signups get a 30% off promo code automatically
+// ================================================================
+const WAITLIST_PROMO_LIMIT = 100;
+const WAITLIST_DISCOUNT    = 30; // 30% off
+
+function generatePromoCode(position) {
+  return \`EARLY\${String(position).padStart(3,"0")}\`;
+}
+
+// POST /api/waitlist
+app.post("/api/waitlist", async (req, res) => {
+  const { name, email, role, company, phone } = req.body;
+  if (!name || !email || !role) return res.status(400).json({ error: "name, email, role required" });
+
+  try {
+    // Check if already on waitlist
+    const { data: existing } = await supabase.from("waitlist").select("*").eq("email", email.toLowerCase()).single();
+    if (existing) return res.status(409).json({ error: "already_on_waitlist", position: existing.position, promoCode: existing.promo_code });
+
+    // Get current count for position
+    const { count } = await supabase.from("waitlist").select("*", { count: "exact", head: true });
+    const position = (count || 0) + 1;
+    const isEarlyBird = position <= WAITLIST_PROMO_LIMIT;
+    const promoCode = isEarlyBird ? generatePromoCode(position) : null;
+
+    const { data, error } = await supabase.from("waitlist").insert({
+      id:         crypto.randomUUID(),
+      name,
+      email:      email.toLowerCase(),
+      role,
+      company:    company || null,
+      phone:      phone || null,
+      position,
+      promo_code: promoCode,
+      promo_sent: false,
+      converted:  false,
+      created_at: new Date().toISOString(),
+    }).select().single();
+
+    if (error) throw error;
+
+    res.json({
+      success:    true,
+      position,
+      total:      position,
+      isEarlyBird,
+      promoCode,
+      discount:   isEarlyBird ? WAITLIST_DISCOUNT : 0,
+      spotsLeft:  Math.max(0, WAITLIST_PROMO_LIMIT - position),
+    });
+  } catch (err) {
+    if (err.code === "23505") return res.status(409).json({ error: "already_on_waitlist" });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/waitlist/count
+app.get("/api/waitlist/count", async (req, res) => {
+  try {
+    const { count } = await supabase.from("waitlist").select("*", { count: "exact", head: true });
+    res.json({ count: count || 0, spotsLeft: Math.max(0, WAITLIST_PROMO_LIMIT - (count || 0)) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/waitlist  (operator only)
+app.get("/api/waitlist", async (req, res) => {
+  try {
+    const { data } = await supabase.from("waitlist").select("*").order("position");
+    res.json({ waitlist: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/waitlist/:id  (mark converted, promo_sent, etc)
+app.patch("/api/waitlist/:id", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("waitlist").update(req.body).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ entry: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // STRIPE WEBHOOK STUB
 // ================================================================
