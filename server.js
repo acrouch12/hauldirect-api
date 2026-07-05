@@ -257,11 +257,11 @@ const LOAD_FIELD_MAP = {
   quickPay: "quick_pay", paidAt: "paid_at",
   postedAt: "posted_at", updatedAt: "updated_at",
   cancelledAt: "cancelled_at", cancelledBy: "cancelled_by", cancelReason: "cancel_reason",
-  cancelHistory: "cancel_history",
+  cancelHistory: "cancel_history", trailerLength: "trailer_length",
   // Already valid snake_case / single-word column names — pass through unchanged
   origin: "origin", destination: "destination", miles: "miles", weight: "weight",
   price: "price", description: "description", dims: "dims", equipmentType: "equipment_type",
-  hazmat: "hazmat", ltl: "ltl", tarp: "tarp", chains: "chains", securement: "securement",
+  hazmat: "hazmat", ltl: "ltl", tarp: "tarp", chains: "chains", securement: "securement_details",
   requirements: "requirements", bids: "bids", progress: "progress", paid: "paid",
   status: "status", commodity: "commodity", qty: "qty", pallets: "pallets",
   oversize: "oversize", stackable: "stackable", fragile: "fragile", special: "special",
@@ -275,13 +275,13 @@ const LOAD_VALID_COLUMNS = new Set([
   "origin_zip", "dest_zip", "origin_city", "origin_state", "delivery_city", "delivery_state",
   "pickup_address", "delivery_address", "contact_name", "contact_phone",
   "miles", "weight", "price", "description", "dims", "equipment_type",
-  "hazmat", "ltl", "tarp", "chains", "securement", "pickup_date", "delivery_date",
+  "hazmat", "ltl", "tarp", "chains", "securement", "securement_details", "pickup_date", "delivery_date",
   "requirements", "bids", "progress", "paid", "paid_at", "quick_pay", "bol_number",
   "ratecon_sent", "delivery_status_confirmed", "posted_at", "updated_at",
   "commodity", "qty", "freight_condition", "pallets", "linear_feet", "oversize",
   "permit_required", "temp_requirement", "temp_spec", "stackable", "do_not_stack",
   "fragile", "unload_type", "appointment_required", "twic_required", "hazmat_class",
-  "special", "cancelled_at", "cancelled_by", "cancel_reason", "cancel_history", "documents",
+  "special", "cancelled_at", "cancelled_by", "cancel_reason", "cancel_history", "documents", "trailer_length",
 ]);
 
 function mapLoadFields(body) {
