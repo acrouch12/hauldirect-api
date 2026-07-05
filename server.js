@@ -577,12 +577,19 @@ function mergeCarrierData(fmcsaResult, insuranceResult) {
   };
 }
 
-// Detention tracking
+// Detention tracking + live position tracking
+const positionStore = {}; // { [loadId]: { lat, lng, updatedAt, carrierId } }
+
 app.post("/api/tracking/ping", async (req, res) => {
   const { loadId, carrierId, lat, lng, facilityLat, facilityLng } = req.body;
   if (!loadId || lat == null || lng == null || facilityLat == null || facilityLng == null)
     return res.status(400).json({ error: "loadId, lat, lng, facilityLat, facilityLng required" });
   const now = Date.now();
+
+  // Always record the carrier's latest real GPS position for the shipper's live map,
+  // regardless of whether they're inside the detention geofence or not.
+  positionStore[loadId] = { lat, lng, updatedAt: now, carrierId: carrierId || null };
+
   const distMiles = haversineMilesServer(lat, lng, facilityLat, facilityLng);
   const insideGeofence = distMiles <= GEOFENCE_RADIUS_MI;
   let record = detentionStore[loadId];
@@ -605,6 +612,23 @@ app.get("/api/tracking/status/:loadId", (req, res) => {
   if (!record) return res.json({ loadId: req.params.loadId, tracked: false });
   const detention = calcDetention(record.arrivalAt, record.departureAt || Date.now());
   res.json({ loadId: record.loadId, tracked: true, arrivalAt: record.arrivalAt, departureAt: record.departureAt, detentionMinutes: detention.billMin, detentionAmount: detention.amount, charged: record.charged });
+});
+
+// Real-time carrier GPS position — used by shipper's live tracking map.
+// Returns null/notFound until the carrier has tapped "Start tracking" at least once.
+app.get("/api/tracking/position/:loadId", (req, res) => {
+  const pos = positionStore[req.params.loadId];
+  if (!pos) return res.json({ loadId: req.params.loadId, hasPosition: false });
+  const ageMs = Date.now() - pos.updatedAt;
+  res.json({
+    loadId: req.params.loadId,
+    hasPosition: true,
+    lat: pos.lat,
+    lng: pos.lng,
+    updatedAt: pos.updatedAt,
+    ageSeconds: Math.round(ageMs / 1000),
+    stale: ageMs > 5 * 60 * 1000, // no ping in 5+ minutes — carrier may have stopped tracking
+  });
 });
 
 
