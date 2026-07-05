@@ -222,9 +222,50 @@ app.get("/api/auth/user/:id", async (req, res) => {
 });
 
 // PATCH /api/auth/user/:id
+// Maps camelCase user fields from the frontend to the snake_case columns
+// used in the Supabase `users` table. Same problem as loads — profile
+// edits were being sent raw and silently failing to save.
+const USER_FIELD_MAP = {
+  equipmentType: "equipment_type", truckDesc: "truck_desc", maxWeight: "max_weight",
+  mcNumber: "mc_number", dotNumber: "dot_number", coiVerified: "coi_verified",
+  coiData: "coi_data", bizVerified: "biz_verified", bizData: "biz_data",
+  stripeConnected: "stripe_connected", currentZip: "current_zip",
+  equipmentStatus: "equipment_status", operatorNotes: "operator_notes",
+  trialStartedAt: "trial_started_at", createdAt: "created_at",
+  complimentaryExpiry: "complimentary_expiry",
+  // Already valid column names — pass through unchanged
+  name: "name", email: "email", role: "role", company: "company", dims: "dims",
+  verification: "verification", payout: "payout", billing: "billing", loc: "loc",
+  lanes: "lanes", eld: "eld", ratings: "ratings", suspended: "suspended",
+  phone: "phone", complimentary: "complimentary", ein: "ein",
+};
+
+const USER_VALID_COLUMNS = new Set([
+  "name", "email", "role", "company", "equipment_type", "truck_desc", "max_weight",
+  "dims", "dot_number", "mc_number", "verification", "coi_verified", "coi_data",
+  "biz_verified", "biz_data", "stripe_connected", "payout", "billing", "loc",
+  "lanes", "eld", "equipment_status", "current_zip", "ratings", "operator_notes",
+  "suspended", "created_at", "phone", "complimentary", "complimentary_expiry",
+  "ein", "trial_started_at",
+]);
+
+function mapUserFields(body) {
+  const mapped = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (USER_VALID_COLUMNS.has(key)) {
+      mapped[key] = value;
+    } else if (USER_FIELD_MAP[key]) {
+      mapped[USER_FIELD_MAP[key]] = value;
+    }
+    // Anything unrecognized (like frontend-only computed fields) is dropped
+    // instead of sent raw, which previously caused the whole update to fail.
+  }
+  return mapped;
+}
+
 app.patch("/api/auth/user/:id", async (req, res) => {
   try {
-    const user = await db.updateUser(req.params.id, req.body);
+    const user = await db.updateUser(req.params.id, mapUserFields(req.body));
     res.json({ user });
   } catch (err) {
     res.status(500).json({ error: err.message });
