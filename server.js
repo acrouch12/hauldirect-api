@@ -235,19 +235,80 @@ app.patch("/api/auth/user/:id", async (req, res) => {
 // LOADS ENDPOINTS
 // ================================================================
 
+// Maps camelCase fields from the frontend to the snake_case columns
+// used in the Supabase `loads` table. Anything not in this map is
+// dropped rather than sent raw — prevents "unknown column" errors
+// that were silently failing every load save and update.
+const LOAD_FIELD_MAP = {
+  shipperId: "shipper_id", shipperName: "shipper_name",
+  truckerId: "carrier_id", carrierId: "carrier_id",
+  originZip: "origin_zip", originCity: "origin_city", originState: "origin_state",
+  destZip: "dest_zip", deliveryCity: "delivery_city", deliveryState: "delivery_state",
+  pickupAddress: "pickup_address", deliveryAddress: "delivery_address",
+  contactName: "contact_name", contactPhone: "contact_phone",
+  pickupDate: "pickup_date", deliveryDate: "delivery_date",
+  hazmatClass: "hazmat_class", freightCondition: "freight_condition",
+  linearFeet: "linear_feet", permitRequired: "permit_required",
+  tempRequirement: "temp_requirement", tempSpec: "temp_spec",
+  doNotStack: "do_not_stack", unloadType: "unload_type",
+  appointmentRequired: "appointment_required", twicRequired: "twic_required",
+  bolNumber: "bol_number", raterconSent: "ratecon_sent",
+  deliveryStatusConfirmed: "delivery_status_confirmed",
+  quickPay: "quick_pay", paidAt: "paid_at",
+  postedAt: "posted_at", updatedAt: "updated_at",
+  cancelledAt: "cancelled_at", cancelledBy: "cancelled_by", cancelReason: "cancel_reason",
+  cancelHistory: "cancel_history",
+  // Already valid snake_case / single-word column names — pass through unchanged
+  origin: "origin", destination: "destination", miles: "miles", weight: "weight",
+  price: "price", description: "description", dims: "dims", equipmentType: "equipment_type",
+  hazmat: "hazmat", ltl: "ltl", tarp: "tarp", chains: "chains", securement: "securement",
+  requirements: "requirements", bids: "bids", progress: "progress", paid: "paid",
+  status: "status", commodity: "commodity", qty: "qty", pallets: "pallets",
+  oversize: "oversize", stackable: "stackable", fragile: "fragile", special: "special",
+  documents: "documents",
+};
+
+// Full set of real column names on the loads table — if the frontend
+// already sends a correct snake_case key, pass it straight through.
+const LOAD_VALID_COLUMNS = new Set([
+  "shipper_id", "shipper_name", "carrier_id", "status", "origin", "destination",
+  "origin_zip", "dest_zip", "origin_city", "origin_state", "delivery_city", "delivery_state",
+  "pickup_address", "delivery_address", "contact_name", "contact_phone",
+  "miles", "weight", "price", "description", "dims", "equipment_type",
+  "hazmat", "ltl", "tarp", "chains", "securement", "pickup_date", "delivery_date",
+  "requirements", "bids", "progress", "paid", "paid_at", "quick_pay", "bol_number",
+  "ratecon_sent", "delivery_status_confirmed", "posted_at", "updated_at",
+  "commodity", "qty", "freight_condition", "pallets", "linear_feet", "oversize",
+  "permit_required", "temp_requirement", "temp_spec", "stackable", "do_not_stack",
+  "fragile", "unload_type", "appointment_required", "twic_required", "hazmat_class",
+  "special", "cancelled_at", "cancelled_by", "cancel_reason", "cancel_history", "documents",
+]);
+
+function mapLoadFields(body) {
+  const mapped = {};
+  for (const [key, value] of Object.entries(body)) {
+    if (LOAD_VALID_COLUMNS.has(key)) {
+      mapped[key] = value; // already correct snake_case column name
+    } else if (LOAD_FIELD_MAP[key]) {
+      mapped[LOAD_FIELD_MAP[key]] = value; // translate camelCase -> snake_case
+    }
+    // Anything not recognized is dropped instead of sent raw, which
+    // previously caused the whole insert/update to silently fail.
+  }
+  return mapped;
+}
+
 // POST /api/loads
 app.post("/api/loads", async (req, res) => {
   try {
     const load = await db.createLoad({
       id:           crypto.randomUUID(),
-      shipper_id:   req.body.shipperId,
-      shipper_name: req.body.shipperName,
       status:       "open",
       carrier_id:   null,
       progress:     0,
       posted_at:    new Date().toISOString(),
       paid:         false,
-      ...req.body,
+      ...mapLoadFields(req.body),
     });
     res.json({ load });
   } catch (err) {
@@ -279,7 +340,7 @@ app.get("/api/loads/:id", async (req, res) => {
 // PATCH /api/loads/:id
 app.patch("/api/loads/:id", async (req, res) => {
   try {
-    const load = await db.updateLoad(req.params.id, req.body);
+    const load = await db.updateLoad(req.params.id, mapLoadFields(req.body));
     res.json({ load });
   } catch (err) {
     res.status(500).json({ error: err.message });
