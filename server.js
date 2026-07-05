@@ -233,6 +233,7 @@ const USER_FIELD_MAP = {
   equipmentStatus: "equipment_status", operatorNotes: "operator_notes",
   trialStartedAt: "trial_started_at", createdAt: "created_at",
   complimentaryExpiry: "complimentary_expiry", companyName: "company",
+  billingCycle: "billing_cycle", requestedTier: "requested_tier",
   // Already valid column names — pass through unchanged
   name: "name", email: "email", role: "role", company: "company", dims: "dims",
   verification: "verification", payout: "payout", billing: "billing", loc: "loc",
@@ -246,7 +247,7 @@ const USER_VALID_COLUMNS = new Set([
   "biz_verified", "biz_data", "stripe_connected", "payout", "billing", "loc",
   "lanes", "eld", "equipment_status", "current_zip", "ratings", "operator_notes",
   "suspended", "created_at", "phone", "complimentary", "complimentary_expiry",
-  "ein", "trial_started_at", "address",
+  "ein", "trial_started_at", "address", "billing_cycle", "requested_tier",
 ]);
 
 function mapUserFields(body) {
