@@ -815,7 +815,7 @@ app.get("/api/insurance-monitor/:dotNumber", async (req, res) => {
 // First 100 signups get a 30% off promo code automatically
 // ================================================================
 const WAITLIST_PROMO_LIMIT = 100;
-const WAITLIST_DISCOUNT    = 30; // 30% off
+const WAITLIST_DISCOUNT    = 20; // 20% off for 3 months
 
 function generatePromoCode(position) {
   return `EARLY${String(position).padStart(3,"0")}`;
@@ -878,6 +878,52 @@ app.get("/api/waitlist/count", async (req, res) => {
   }
 });
 
+// GET /api/waitlist/promo/:code — validate a waitlist early-bird promo code.
+// Checks it exists, hasn't already been redeemed, and returns the benefit.
+// This is the real, persisted source of truth — the code stays valid
+// forever until someone actually redeems it (no expiration date).
+app.get("/api/waitlist/promo/:code", async (req, res) => {
+  try {
+    const code = req.params.code.trim().toUpperCase();
+    const { data: entry } = await supabase.from("waitlist").select("*").eq("promo_code", code).single();
+    if (!entry) return res.status(404).json({ valid: false, error: "Invalid promo code." });
+    if (entry.promo_redeemed) return res.status(409).json({ valid: false, error: "This promo code has already been used." });
+    res.json({
+      valid: true,
+      code,
+      discountPercent: WAITLIST_DISCOUNT,
+      durationMonths: 3,
+      waitlistEntryId: entry.id,
+      name: entry.name,
+    });
+  } catch (err) {
+    res.status(500).json({ valid: false, error: err.message });
+  }
+});
+
+// POST /api/waitlist/promo/:code/redeem — marks a waitlist promo code as
+// used, tied to the user redeeming it. One-time use, enforced server-side.
+app.post("/api/waitlist/promo/:code/redeem", async (req, res) => {
+  try {
+    const code = req.params.code.trim().toUpperCase();
+    const { userId } = req.body;
+    const { data: entry } = await supabase.from("waitlist").select("*").eq("promo_code", code).single();
+    if (!entry) return res.status(404).json({ error: "Invalid promo code." });
+    if (entry.promo_redeemed) return res.status(409).json({ error: "This promo code has already been used." });
+
+    const { data: updated, error } = await supabase.from("waitlist").update({
+      promo_redeemed: true,
+      promo_redeemed_at: new Date().toISOString(),
+      promo_redeemed_by_user_id: userId || null,
+    }).eq("id", entry.id).select().single();
+    if (error) throw error;
+
+    res.json({ success: true, discountPercent: WAITLIST_DISCOUNT, durationMonths: 3, entry: updated });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/waitlist  (operator only)
 app.get("/api/waitlist", async (req, res) => {
   try {
@@ -910,6 +956,66 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), (req
 // ================================================================
 // HEALTH CHECK
 // ================================================================
+
+
+// ================================================================
+// AI DOCUMENT VERIFICATION — server-side proxy to Anthropic
+// Used for COI (insurance) and business document verification, both
+// of which send a base64 file (image or PDF) plus a prompt. Same
+// reasoning as the chatbot proxy did — this can never work as a direct
+// browser call to api.anthropic.com once deployed.
+// ================================================================
+app.post("/api/ai-verify-document", async (req, res) => {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    return res.status(503).json({ error: "ai_not_configured", message: "ANTHROPIC_API_KEY not set on the server yet." });
+  }
+  const { fileBase64, mimeType, prompt } = req.body;
+  if (!fileBase64 || !mimeType || !prompt) {
+    return res.status(400).json({ error: "fileBase64, mimeType, and prompt are required" });
+  }
+
+  const isImage = mimeType.startsWith("image/");
+  const isPdf = mimeType === "application/pdf";
+  if (!isImage && !isPdf) {
+    return res.status(400).json({ error: "Only PDF, JPG, or PNG files are supported." });
+  }
+
+  const contentBlock = isPdf
+    ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: fileBase64 } }
+    : { type: "image", source: { type: "base64", media_type: mimeType, data: fileBase64 } };
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1000,
+        messages: [{ role: "user", content: [contentBlock, { type: "text", text: prompt }] }],
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Anthropic API error:", response.status, errText);
+      return res.status(502).json({ error: "anthropic_error", message: "AI verification service unavailable — please try again." });
+    }
+
+    const data = await response.json();
+    const raw = (data.content || []).map((c) => c.text || "").join("");
+    res.json({ raw });
+  } catch (err) {
+    console.error("AI document verify proxy error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 app.get("/api/health", async (req, res) => {
   let dbConnected = false;
   try {
@@ -922,6 +1028,7 @@ app.get("/api/health", async (req, res) => {
     supabaseConfigured: !!process.env.SUPABASE_URL,
     databaseConnected: dbConnected,
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
+    aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
   });
 });
 
