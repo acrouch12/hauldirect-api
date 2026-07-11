@@ -234,6 +234,9 @@ const USER_FIELD_MAP = {
   trialStartedAt: "trial_started_at", createdAt: "created_at",
   complimentaryExpiry: "complimentary_expiry", companyName: "company",
   billingCycle: "billing_cycle", requestedTier: "requested_tier",
+  factoringEnabled: "factoring_enabled", factoringCompany: "factoring_company",
+  factoringEmail: "factoring_email", factoringPhone: "factoring_phone",
+  factoringNoaNumber: "factoring_noa_number",
   // Already valid column names — pass through unchanged
   name: "name", email: "email", role: "role", company: "company", dims: "dims",
   verification: "verification", payout: "payout", billing: "billing", loc: "loc",
@@ -248,6 +251,7 @@ const USER_VALID_COLUMNS = new Set([
   "lanes", "eld", "equipment_status", "current_zip", "ratings", "operator_notes",
   "suspended", "created_at", "phone", "complimentary", "complimentary_expiry",
   "ein", "trial_started_at", "address", "billing_cycle", "requested_tier",
+  "factoring_enabled", "factoring_company", "factoring_email", "factoring_phone", "factoring_noa_number",
 ]);
 
 function mapUserFields(body) {
@@ -825,6 +829,7 @@ function generatePromoCode(position) {
 app.post("/api/waitlist", async (req, res) => {
   const { name, email, role, company, phone } = req.body;
   if (!name || !email || !role) return res.status(400).json({ error: "name, email, role required" });
+  if (!company || !company.trim()) return res.status(400).json({ error: "Business name is required." });
 
   try {
     // Check if already on waitlist
