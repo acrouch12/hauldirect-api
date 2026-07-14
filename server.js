@@ -13,6 +13,7 @@
 
 const express = require("express");
 const cors    = require("cors");
+const crypto  = require("crypto");
 const rateLimit = require("express-rate-limit");
 const { createClient } = require("@supabase/supabase-js");
 
@@ -821,8 +822,16 @@ app.get("/api/insurance-monitor/:dotNumber", async (req, res) => {
 const WAITLIST_PROMO_LIMIT = 100;
 const WAITLIST_DISCOUNT    = 20; // 20% off for 3 months
 
+// Generates a random, non-sequential promo code so codes can't be guessed
+// or brute-forced (the old EARLY001-EARLY100 format was fully predictable).
+// Avoids visually ambiguous characters (0/O, 1/I/L) for easy manual entry.
 function generatePromoCode(position) {
-  return `EARLY${String(position).padStart(3,"0")}`;
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  let code = "";
+  for (let i = 0; i < 6; i++) {
+    code += chars[crypto.randomInt(chars.length)];
+  }
+  return `EARLY-${code}`;
 }
 
 // POST /api/waitlist
