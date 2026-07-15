@@ -24,9 +24,17 @@ if (!process.env.FMCSA_API_KEY)    process.env.FMCSA_API_KEY    = "eeb7553869b3d
 if (!process.env.SUPABASE_URL)     process.env.SUPABASE_URL     = "https://qvusaeareoylwgkqfluw.supabase.co";
 if (!process.env.SUPABASE_ANON_KEY) process.env.SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF2dXNhZWFyZW95bHdna3FmbHV3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI5NDYxMjYsImV4cCI6MjA5ODUyMjEyNn0.e7gdCeSj-yes_NuxWQDgCso0YHVZeaQlgVcC8aRH3jA";
 
+// IMPORTANT: the backend should use the SERVICE ROLE key, not the anon key.
+// The service role key is meant for trusted server-side code only — it
+// safely bypasses Row Level Security (RLS), which is required once RLS is
+// enabled on your tables (see supabase_schema.sql for the RLS setup).
+// Get this from Supabase → Settings → API → "service_role" secret key.
+// Falls back to the anon key only if the service key hasn't been set yet —
+// but note that with RLS enabled, using only the anon key here will cause
+// every database read/write in this file to start failing.
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_ANON_KEY
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY
 );
 
 const app = express();
@@ -1040,6 +1048,7 @@ app.get("/api/health", async (req, res) => {
     status: "ok",
     fmcsaKeyConfigured: !!process.env.FMCSA_API_KEY,
     supabaseConfigured: !!process.env.SUPABASE_URL,
+    supabaseUsingServiceRole: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
     databaseConnected: dbConnected,
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
     aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
