@@ -1062,5 +1062,6 @@ app.listen(PORT, () => {
   console.log(`╚══════════════════════════════════════╝\n`);
   console.log(`✅  FMCSA key:    ${process.env.FMCSA_API_KEY ? process.env.FMCSA_API_KEY.slice(0,6) + "…" : "NOT SET"}`);
   console.log(`✅  Supabase URL: ${process.env.SUPABASE_URL}`);
+  console.log(`${process.env.SUPABASE_SERVICE_ROLE_KEY ? "✅" : "⚠️ "}  Supabase key:    ${process.env.SUPABASE_SERVICE_ROLE_KEY ? "SERVICE ROLE (bypasses RLS) — " + process.env.SUPABASE_SERVICE_ROLE_KEY.slice(0,12) + "…" : "ANON KEY ONLY — RLS will block writes! Set SUPABASE_SERVICE_ROLE_KEY in Railway."}`);
   console.log(`\nHealth: http://localhost:${PORT}/api/health\n`);
 });
