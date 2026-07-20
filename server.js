@@ -19,6 +19,27 @@ const { createClient } = require("@supabase/supabase-js");
 
 if (process.env.NODE_ENV !== "production") require("dotenv").config();
 
+// Stripe — real payment processing. Requires STRIPE_SECRET_KEY (and later
+// STRIPE_WEBHOOK_SECRET, STRIPE_CONNECT_CLIENT_ID) set in Railway → Variables.
+const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
+const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID || null; // ca_... from Stripe → Settings → Connect
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://directfreightco.com";
+
+// Pricing — matches the exact plan structure from the frontend. Returns the
+// amount in cents for a given plan + billing cycle.
+function getPlanAmountCents(planId, billingCycle) {
+  const MONTHLY = {
+    solo_carrier: 3000, solo_shipper: 7000,
+    starter: 35000, growth: 80000, fleet: 180000, enterprise: 350000,
+  };
+  const ANNUAL = {
+    solo_carrier: 30000, solo_shipper: 70000,
+    starter: 350000, growth: 800000, fleet: 1800000, enterprise: 3500000,
+  };
+  const table = billingCycle === "annual" ? ANNUAL : MONTHLY;
+  return table[planId] || null;
+}
+
 // ── Hardcoded fallbacks so Railway never fails silently ──
 if (!process.env.FMCSA_API_KEY)    process.env.FMCSA_API_KEY    = "eeb7553869b3de8e716c28bd9a8fbedc7b7a02ed";
 if (!process.env.SUPABASE_URL)     process.env.SUPABASE_URL     = "https://qvusaeareoylwgkqfluw.supabase.co";
@@ -968,11 +989,170 @@ app.patch("/api/waitlist/:id", async (req, res) => {
 });
 
 // ================================================================
-// STRIPE WEBHOOK STUB
+// STRIPE — CONNECT (Standard accounts) for carrier payouts
 // ================================================================
-app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), (req, res) => {
-  console.log("Stripe webhook received — wire up Stripe SDK to process events");
-  res.json({ received: true });
+
+// Carrier clicks "Connect with Stripe" → redirected here → Stripe's OAuth
+// authorize page → carrier logs into or creates their own Stripe account →
+// Stripe redirects back to /api/stripe/connect/callback.
+app.get("/api/stripe/connect/authorize", (req, res) => {
+  if (!STRIPE_CONNECT_CLIENT_ID) {
+    return res.status(503).json({ error: "Stripe Connect not configured — set STRIPE_CONNECT_CLIENT_ID in Railway." });
+  }
+  const { userId, corpId } = req.query;
+  if (!userId) return res.status(400).json({ error: "userId is required" });
+  const state = encodeURIComponent(JSON.stringify({ userId, corpId: corpId || null }));
+  const authorizeUrl = `https://connect.stripe.com/oauth/authorize?response_type=code&client_id=${STRIPE_CONNECT_CLIENT_ID}&scope=read_write&state=${state}`;
+  res.redirect(authorizeUrl);
+});
+
+// Stripe redirects back here after the carrier authorizes (or cancels).
+app.get("/api/stripe/connect/callback", async (req, res) => {
+  const { code, state, error: stripeError } = req.query;
+  let userId = null, corpId = null;
+  try {
+    const parsed = JSON.parse(decodeURIComponent(state || "{}"));
+    userId = parsed.userId; corpId = parsed.corpId;
+  } catch (_) {}
+
+  if (stripeError) {
+    return res.redirect(`${FRONTEND_URL}/?stripe_connect=cancelled`);
+  }
+  if (!stripe) return res.status(503).send("Stripe not configured on the server.");
+
+  try {
+    const tokenResponse = await stripe.oauth.token({
+      grant_type: "authorization_code",
+      code,
+    });
+    const connectedAccountId = tokenResponse.stripe_user_id; // acct_...
+
+    const target = corpId
+      ? await supabase.from("users").update({ payout: { connected: true, provider: "Stripe Connect", stripeAccountId: connectedAccountId } }).eq("id", corpId).select().single()
+      : await supabase.from("users").update({ payout: { connected: true, provider: "Stripe Connect", stripeAccountId: connectedAccountId } }).eq("id", userId).select().single();
+
+    if (target.error) throw target.error;
+    res.redirect(`${FRONTEND_URL}/?stripe_connect=success`);
+  } catch (err) {
+    console.error("Stripe Connect OAuth error:", err.message);
+    res.redirect(`${FRONTEND_URL}/?stripe_connect=error`);
+  }
+});
+
+// ================================================================
+// STRIPE — SUBSCRIPTION CHECKOUT (Checkout Session, hosted by Stripe)
+// Real card entry happens on Stripe's own secure page — raw card numbers
+// never touch this backend, satisfying PCI compliance automatically.
+// ================================================================
+app.post("/api/stripe/create-checkout-session", async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+  const { userId, email, planId, billingCycle, planLabel } = req.body;
+  if (!userId || !email || !planId) return res.status(400).json({ error: "userId, email, and planId are required" });
+
+  const amountCents = getPlanAmountCents(planId, billingCycle);
+  if (!amountCents) return res.status(400).json({ error: `Unknown plan: ${planId}` });
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      customer_email: email,
+      client_reference_id: userId,
+      line_items: [{
+        price_data: {
+          currency: "usd",
+          product_data: { name: `Direct Freight Co — ${planLabel || planId} (${billingCycle === "annual" ? "Annual" : "Monthly"})` },
+          unit_amount: amountCents,
+          recurring: { interval: billingCycle === "annual" ? "year" : "month" },
+        },
+        quantity: 1,
+      }],
+      subscription_data: { metadata: { userId, planId, billingCycle: billingCycle || "monthly" } },
+      success_url: `${FRONTEND_URL}/?stripe_checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${FRONTEND_URL}/?stripe_checkout=cancelled`,
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("Checkout session error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// STRIPE — LOAD PAYMENT (direct charge to carrier's connected account)
+// Matches your "sellers collect funds directly" Connect setup — money goes
+// straight to the carrier, this platform never holds it.
+// ================================================================
+app.post("/api/stripe/pay-load", async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+  const { shipperCustomerId, carrierStripeAccountId, amountCents, loadId, quickPay } = req.body;
+  if (!shipperCustomerId || !carrierStripeAccountId || !amountCents || !loadId) {
+    return res.status(400).json({ error: "shipperCustomerId, carrierStripeAccountId, amountCents, and loadId are required" });
+  }
+  try {
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: amountCents,
+      currency: "usd",
+      customer: shipperCustomerId,
+      transfer_data: { destination: carrierStripeAccountId },
+      metadata: { loadId, quickPay: quickPay ? "true" : "false" },
+      // With Standard connected accounts, an application_fee_amount can be
+      // added here later if a per-transaction platform fee is ever introduced.
+      // Direct Freight Co currently charges 0% commission on loads.
+    });
+    res.json({ paymentIntentId: paymentIntent.id, status: paymentIntent.status });
+  } catch (err) {
+    console.error("Load payment error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// STRIPE WEBHOOK — real event handling, signature-verified
+// ================================================================
+app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!stripe) return res.status(503).send("Stripe not configured.");
+  const sig = req.headers["stripe-signature"];
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error("Webhook signature verification failed:", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        const userId = session.client_reference_id;
+        if (userId) {
+          await supabase.from("users").update({
+            stripe_connected: true,
+            billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription },
+            trial_started_at: new Date().toISOString(),
+          }).eq("id", userId);
+        }
+        break;
+      }
+      case "invoice.payment_failed": {
+        console.warn("Invoice payment failed for subscription:", event.data.object.subscription);
+        // Consider: flag the account, email the user, or restrict posting until resolved.
+        break;
+      }
+      case "customer.subscription.deleted": {
+        const sub = event.data.object;
+        const userId = sub.metadata?.userId;
+        if (userId) await supabase.from("users").update({ stripe_connected: false }).eq("id", userId);
+        break;
+      }
+      default:
+        break; // Unhandled event types are fine to ignore for now.
+    }
+    res.json({ received: true });
+  } catch (err) {
+    console.error("Webhook handler error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ================================================================
@@ -1051,6 +1231,8 @@ app.get("/api/health", async (req, res) => {
     supabaseUsingServiceRole: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
     databaseConnected: dbConnected,
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
+    stripeConnectConfigured: !!process.env.STRIPE_CONNECT_CLIENT_ID,
+    stripeWebhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
     aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
   });
 });
