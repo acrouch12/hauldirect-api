@@ -21,8 +21,8 @@ if (process.env.NODE_ENV !== "production") require("dotenv").config();
 
 // Stripe — real payment processing. Requires STRIPE_SECRET_KEY (and later
 // STRIPE_WEBHOOK_SECRET, STRIPE_CONNECT_CLIENT_ID) set in Railway → Variables.
-const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
-const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID || null; // ca_... from Stripe → Settings → Connect
+const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY.trim()) : null;
+const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID?.trim() || null; // ca_... from Stripe → Settings → Connect
 // Both your live site and test site currently share this one backend, so
 // Stripe needs to know how to send people back to whichever one they
 // actually started from — not just always production. This allowlist
@@ -1248,9 +1248,6 @@ app.get("/api/health", async (req, res) => {
     databaseConnected: dbConnected,
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
     stripeConnectConfigured: !!process.env.STRIPE_CONNECT_CLIENT_ID,
-    stripeConnectClientIdDebug: process.env.STRIPE_CONNECT_CLIENT_ID
-      ? { value: process.env.STRIPE_CONNECT_CLIENT_ID, length: process.env.STRIPE_CONNECT_CLIENT_ID.length }
-      : null, // TEMPORARY — remove once the client ID mismatch is solved
     stripeWebhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
     aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
   });
