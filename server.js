@@ -23,7 +23,20 @@ if (process.env.NODE_ENV !== "production") require("dotenv").config();
 // STRIPE_WEBHOOK_SECRET, STRIPE_CONNECT_CLIENT_ID) set in Railway → Variables.
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY) : null;
 const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID || null; // ca_... from Stripe → Settings → Connect
-const FRONTEND_URL = process.env.FRONTEND_URL || "https://directfreightco.com";
+// Both your live site and test site currently share this one backend, so
+// Stripe needs to know how to send people back to whichever one they
+// actually started from — not just always production. This allowlist
+// keeps that safe (an open redirect elsewhere would be a real security
+// risk, so only these specific known origins are ever used).
+const ALLOWED_FRONTEND_ORIGINS = [
+  "https://directfreightco.com",
+  "https://www.directfreightco.com",
+  process.env.TEST_FRONTEND_URL, // set this in Railway to your test Netlify URL, e.g. https://your-test-site.netlify.app
+].filter(Boolean);
+
+function safeFrontendOrigin(candidate) {
+  return ALLOWED_FRONTEND_ORIGINS.includes(candidate) ? candidate : ALLOWED_FRONTEND_ORIGINS[0];
+}
 
 // Pricing — matches the exact plan structure from the frontend. Returns the
 // amount in cents for a given plan + billing cycle.
@@ -999,9 +1012,10 @@ app.get("/api/stripe/connect/authorize", (req, res) => {
   if (!STRIPE_CONNECT_CLIENT_ID) {
     return res.status(503).json({ error: "Stripe Connect not configured — set STRIPE_CONNECT_CLIENT_ID in Railway." });
   }
-  const { userId, corpId } = req.query;
+  const { userId, corpId, returnOrigin } = req.query;
   if (!userId) return res.status(400).json({ error: "userId is required" });
-  const state = encodeURIComponent(JSON.stringify({ userId, corpId: corpId || null }));
+  const origin = safeFrontendOrigin(returnOrigin);
+  const state = encodeURIComponent(JSON.stringify({ userId, corpId: corpId || null, origin }));
   const authorizeUrl = `https://connect.stripe.com/oauth/authorize?response_type=code&client_id=${STRIPE_CONNECT_CLIENT_ID}&scope=read_write&state=${state}`;
   res.redirect(authorizeUrl);
 });
@@ -1009,14 +1023,15 @@ app.get("/api/stripe/connect/authorize", (req, res) => {
 // Stripe redirects back here after the carrier authorizes (or cancels).
 app.get("/api/stripe/connect/callback", async (req, res) => {
   const { code, state, error: stripeError } = req.query;
-  let userId = null, corpId = null;
+  let userId = null, corpId = null, origin = ALLOWED_FRONTEND_ORIGINS[0];
   try {
     const parsed = JSON.parse(decodeURIComponent(state || "{}"));
     userId = parsed.userId; corpId = parsed.corpId;
+    origin = safeFrontendOrigin(parsed.origin);
   } catch (_) {}
 
   if (stripeError) {
-    return res.redirect(`${FRONTEND_URL}/?stripe_connect=cancelled`);
+    return res.redirect(`${origin}/?stripe_connect=cancelled`);
   }
   if (!stripe) return res.status(503).send("Stripe not configured on the server.");
 
@@ -1032,10 +1047,10 @@ app.get("/api/stripe/connect/callback", async (req, res) => {
       : await supabase.from("users").update({ payout: { connected: true, provider: "Stripe Connect", stripeAccountId: connectedAccountId } }).eq("id", userId).select().single();
 
     if (target.error) throw target.error;
-    res.redirect(`${FRONTEND_URL}/?stripe_connect=success`);
+    res.redirect(`${origin}/?stripe_connect=success`);
   } catch (err) {
     console.error("Stripe Connect OAuth error:", err.message);
-    res.redirect(`${FRONTEND_URL}/?stripe_connect=error`);
+    res.redirect(`${origin}/?stripe_connect=error`);
   }
 });
 
@@ -1046,11 +1061,12 @@ app.get("/api/stripe/connect/callback", async (req, res) => {
 // ================================================================
 app.post("/api/stripe/create-checkout-session", async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
-  const { userId, email, planId, billingCycle, planLabel } = req.body;
+  const { userId, email, planId, billingCycle, planLabel, returnOrigin } = req.body;
   if (!userId || !email || !planId) return res.status(400).json({ error: "userId, email, and planId are required" });
 
   const amountCents = getPlanAmountCents(planId, billingCycle);
   if (!amountCents) return res.status(400).json({ error: `Unknown plan: ${planId}` });
+  const origin = safeFrontendOrigin(returnOrigin);
 
   try {
     const session = await stripe.checkout.sessions.create({
@@ -1067,8 +1083,8 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
         quantity: 1,
       }],
       subscription_data: { metadata: { userId, planId, billingCycle: billingCycle || "monthly" } },
-      success_url: `${FRONTEND_URL}/?stripe_checkout=success&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}/?stripe_checkout=cancelled`,
+      success_url: `${origin}/?stripe_checkout=success&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/?stripe_checkout=cancelled`,
     });
     res.json({ url: session.url });
   } catch (err) {
@@ -1232,6 +1248,9 @@ app.get("/api/health", async (req, res) => {
     databaseConnected: dbConnected,
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
     stripeConnectConfigured: !!process.env.STRIPE_CONNECT_CLIENT_ID,
+    stripeConnectClientIdDebug: process.env.STRIPE_CONNECT_CLIENT_ID
+      ? { value: process.env.STRIPE_CONNECT_CLIENT_ID, length: process.env.STRIPE_CONNECT_CLIENT_ID.length }
+      : null, // TEMPORARY — remove once the client ID mismatch is solved
     stripeWebhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
     aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
   });
