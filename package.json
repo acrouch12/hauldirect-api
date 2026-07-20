@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
-  "dependencies": {
+  "dependencies": { 
     "@supabase/supabase-js": "^2.39.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
@@ -15,5 +15,6 @@
     "express-rate-limit": "^7.1.5",
     "node-fetch": "^2.7.0",
     "nodemon": "^3.0.2"
-  }
+     "stripe": "^17.0.0"
+  } 
 }
