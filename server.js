@@ -22,7 +22,8 @@ if (process.env.NODE_ENV !== "production") require("dotenv").config();
 // Stripe — real payment processing. Requires STRIPE_SECRET_KEY (and later
 // STRIPE_WEBHOOK_SECRET, STRIPE_CONNECT_CLIENT_ID) set in Railway → Variables.
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY.trim()) : null;
-const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID?.trim() || null; // ca_... from Stripe → Settings → Connect
+const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID?.trim() || null; // no longer needed for Express Connect — kept only for backward compatibility
+const API_URL = process.env.API_URL || "https://hauldirect-api-production.up.railway.app"; // this backend's own public URL, used to build Stripe return links
 // Both your live site and test site currently share this one backend, so
 // Stripe needs to know how to send people back to whichever one they
 // actually started from — not just always production. This allowlist
@@ -1002,54 +1003,78 @@ app.patch("/api/waitlist/:id", async (req, res) => {
 });
 
 // ================================================================
-// STRIPE — CONNECT (Standard accounts) for carrier payouts
+// STRIPE — CONNECT (Express accounts) for carrier payouts
+// Express uses Account Links, not OAuth — no Client ID needed, and it
+// gives carriers a much lighter onboarding built for marketplace sellers,
+// instead of the full "run your own Stripe business" Standard experience.
 // ================================================================
 
-// Carrier clicks "Connect with Stripe" → redirected here → Stripe's OAuth
-// authorize page → carrier logs into or creates their own Stripe account →
-// Stripe redirects back to /api/stripe/connect/callback.
-app.get("/api/stripe/connect/authorize", (req, res) => {
-  if (!STRIPE_CONNECT_CLIENT_ID) {
-    return res.status(503).json({ error: "Stripe Connect not configured — set STRIPE_CONNECT_CLIENT_ID in Railway." });
-  }
-  const { userId, corpId, returnOrigin } = req.query;
+// Carrier clicks "Connect with Stripe" → this creates (or reuses) an Express
+// connected account, then sends them to Stripe's hosted onboarding link.
+app.get("/api/stripe/connect/authorize", async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+  const { userId, corpId, email, returnOrigin } = req.query;
   if (!userId) return res.status(400).json({ error: "userId is required" });
   const origin = safeFrontendOrigin(returnOrigin);
-  const state = encodeURIComponent(JSON.stringify({ userId, corpId: corpId || null, origin }));
-  const authorizeUrl = `https://connect.stripe.com/oauth/authorize?response_type=code&client_id=${STRIPE_CONNECT_CLIENT_ID}&scope=read_write&state=${state}`;
-  res.redirect(authorizeUrl);
+  const targetId = corpId || userId;
+
+  try {
+    // Reuse an existing Express account for this user if one was already
+    // started, instead of creating a duplicate on every retry.
+    const { data: existing } = await supabase.from("users").select("payout").eq("id", targetId).single();
+    let accountId = existing?.payout?.stripeAccountId;
+
+    if (!accountId) {
+      const account = await stripe.accounts.create({
+        type: "express",
+        email: email || undefined,
+        capabilities: { transfers: { requested: true } },
+      });
+      accountId = account.id;
+      await supabase.from("users").update({
+        payout: { connected: false, provider: "Stripe Connect (Express)", stripeAccountId: accountId },
+      }).eq("id", targetId);
+    }
+
+    const returnParams = encodeURIComponent(JSON.stringify({ userId, corpId: corpId || null, origin, accountId }));
+    const accountLink = await stripe.accountLinks.create({
+      account: accountId,
+      refresh_url: `${API_URL}/api/stripe/connect/authorize?userId=${userId}${corpId ? `&corpId=${corpId}` : ""}&returnOrigin=${encodeURIComponent(origin)}`,
+      return_url: `${API_URL}/api/stripe/connect/express-return?data=${returnParams}`,
+      type: "account_onboarding",
+    });
+    res.redirect(accountLink.url);
+  } catch (err) {
+    console.error("Stripe Express Connect error:", err.message);
+    res.redirect(`${origin}/?stripe_connect=error`);
+  }
 });
 
-// Stripe redirects back here after the carrier authorizes (or cancels).
-app.get("/api/stripe/connect/callback", async (req, res) => {
-  const { code, state, error: stripeError } = req.query;
-  let userId = null, corpId = null, origin = ALLOWED_FRONTEND_ORIGINS[0];
+// Stripe sends the carrier back here once they finish (or leave) onboarding.
+app.get("/api/stripe/connect/express-return", async (req, res) => {
+  let userId = null, corpId = null, origin = ALLOWED_FRONTEND_ORIGINS[0], accountId = null;
   try {
-    const parsed = JSON.parse(decodeURIComponent(state || "{}"));
-    userId = parsed.userId; corpId = parsed.corpId;
+    const parsed = JSON.parse(decodeURIComponent(req.query.data || "{}"));
+    userId = parsed.userId; corpId = parsed.corpId; accountId = parsed.accountId;
     origin = safeFrontendOrigin(parsed.origin);
   } catch (_) {}
 
-  if (stripeError) {
-    return res.redirect(`${origin}/?stripe_connect=cancelled`);
-  }
-  if (!stripe) return res.status(503).send("Stripe not configured on the server.");
+  if (!stripe || !accountId) return res.redirect(`${origin}/?stripe_connect=error`);
 
   try {
-    const tokenResponse = await stripe.oauth.token({
-      grant_type: "authorization_code",
-      code,
-    });
-    const connectedAccountId = tokenResponse.stripe_user_id; // acct_...
+    // Check the REAL account status with Stripe — Account Links don't tell
+    // you whether onboarding actually finished, only that they came back.
+    const account = await stripe.accounts.retrieve(accountId);
+    const fullyOnboarded = account.details_submitted && account.charges_enabled;
+    const targetId = corpId || userId;
 
-    const target = corpId
-      ? await supabase.from("users").update({ payout: { connected: true, provider: "Stripe Connect", stripeAccountId: connectedAccountId } }).eq("id", corpId).select().single()
-      : await supabase.from("users").update({ payout: { connected: true, provider: "Stripe Connect", stripeAccountId: connectedAccountId } }).eq("id", userId).select().single();
+    await supabase.from("users").update({
+      payout: { connected: fullyOnboarded, provider: "Stripe Connect (Express)", stripeAccountId: accountId },
+    }).eq("id", targetId);
 
-    if (target.error) throw target.error;
-    res.redirect(`${origin}/?stripe_connect=success`);
+    res.redirect(`${origin}/?stripe_connect=${fullyOnboarded ? "success" : "incomplete"}`);
   } catch (err) {
-    console.error("Stripe Connect OAuth error:", err.message);
+    console.error("Stripe Express return check error:", err.message);
     res.redirect(`${origin}/?stripe_connect=error`);
   }
 });
@@ -1247,7 +1272,7 @@ app.get("/api/health", async (req, res) => {
     supabaseUsingServiceRole: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
     databaseConnected: dbConnected,
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
-    stripeConnectConfigured: !!process.env.STRIPE_CONNECT_CLIENT_ID,
+    stripeConnectConfigured: !!stripe, // Express Connect only needs the Stripe secret key, not a Client ID
     stripeWebhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
     aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
   });
