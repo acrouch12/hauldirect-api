@@ -773,6 +773,26 @@ app.get("/api/tracking/status/:loadId", (req, res) => {
   res.json({ loadId: record.loadId, tracked: true, arrivalAt: record.arrivalAt, departureAt: record.departureAt, detentionMinutes: detention.billMin, detentionAmount: detention.amount, charged: record.charged });
 });
 
+// Explicit "I'm leaving now" — lets a carrier end detention tracking
+// immediately (whether they were on continuous GPS or checked in manually),
+// instead of only detecting departure reactively from the next location
+// ping showing them outside the geofence.
+app.post("/api/tracking/checkout", (req, res) => {
+  const { loadId } = req.body;
+  if (!loadId) return res.status(400).json({ error: "loadId required" });
+  const record = detentionStore[loadId];
+  if (!record) return res.json({ loadId, tracked: false });
+  if (!record.departureAt) {
+    const now = Date.now();
+    record.departureAt = now;
+    const { amount } = calcDetention(record.arrivalAt, now);
+    record.detentionAmount = amount;
+    record.charged = amount > 0;
+  }
+  const detention = calcDetention(record.arrivalAt, record.departureAt);
+  res.json({ loadId, tracked: true, arrivalAt: record.arrivalAt, departureAt: record.departureAt, detentionMinutes: detention.billMin, detentionAmount: detention.amount, charged: record.charged, insideGeofence: false, detentionActive: false });
+});
+
 // Real-time carrier GPS position — used by shipper's live tracking map.
 // Returns null/notFound until the carrier has tapped "Start tracking" at least once.
 app.get("/api/tracking/position/:loadId", (req, res) => {
