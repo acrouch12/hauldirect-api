@@ -332,7 +332,7 @@ app.patch("/api/auth/user/:id", async (req, res) => {
 const LOAD_FIELD_MAP = {
   shipperId: "shipper_id", shipperName: "shipper_name",
   truckerId: "carrier_id", carrierId: "carrier_id",
-  deliveredAt: "delivered_at",
+  deliveredAt: "delivered_at", pickedUpAt: "picked_up_at",
   originZip: "origin_zip", originCity: "origin_city", originState: "origin_state",
   destZip: "dest_zip", deliveryCity: "delivery_city", deliveryState: "delivery_state",
   pickupAddress: "pickup_address", deliveryAddress: "delivery_address",
@@ -368,7 +368,7 @@ const LOAD_VALID_COLUMNS = new Set([
   "miles", "weight", "price", "description", "dims", "equipment_type",
   "hazmat", "ltl", "tarp", "chains", "securement", "securement_details", "pickup_date", "delivery_date",
   "requirements", "bids", "progress", "paid", "paid_at", "quick_pay", "bol_number",
-  "ratecon_sent", "delivery_status_confirmed", "posted_at", "updated_at", "delivered_at",
+  "ratecon_sent", "delivery_status_confirmed", "posted_at", "updated_at", "delivered_at", "picked_up_at",
   "commodity", "qty", "freight_condition", "pallets", "linear_feet", "oversize",
   "permit_required", "temp_requirement", "temp_spec", "stackable", "do_not_stack",
   "fragile", "unload_type", "appointment_required", "twic_required", "hazmat_class",
