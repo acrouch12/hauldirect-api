@@ -530,6 +530,42 @@ app.get("/api/messages/:loadId/:carrierId", async (req, res) => {
   }
 });
 
+// GET /api/messages/inbox/:carrierId — every distinct conversation thread
+// for a carrier, across all loads AND non-load-tied messages (like ones
+// sent from a shipper's Nearby Capacity page). Without this, a carrier had
+// no way to discover a message ever arrived unless it happened to be tied
+// to a load they already knew to open — a real gap for anything sent
+// outside a specific load's own chat.
+app.get("/api/messages/inbox/:carrierId", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from("messages")
+      .select("*")
+      .eq("carrier_id", req.params.carrierId)
+      .order("sent_at", { ascending: false });
+    if (error) throw error;
+
+    const threads = {};
+    for (const m of data) {
+      if (!threads[m.load_id]) {
+        threads[m.load_id] = {
+          loadId: m.load_id,
+          carrierId: m.carrier_id,
+          isGeneral: m.load_id.startsWith("general-"),
+          lastMessage: m.text,
+          lastSenderName: m.name,
+          lastSentAt: m.sent_at,
+          messageCount: 0,
+        };
+      }
+      threads[m.load_id].messageCount += 1;
+    }
+    res.json({ threads: Object.values(threads) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // DOCUMENTS ENDPOINTS
 // ================================================================
@@ -633,7 +669,11 @@ app.delete("/api/operator/users/:id", async (req, res) => {
 const FREE_WINDOW_MS     = 2 * 60 * 60 * 1000;
 const DETENTION_RATE_HR  = 60;
 const INCREMENT_MIN      = 15;
-const GEOFENCE_RADIUS_MI = 1.0;
+// 5 miles, not 1 — facility coordinates are derived from the origin ZIP
+// code's centroid (real geocoding, not exact street address), and ZIP codes
+// can span several miles, especially in less dense areas. A tight 1-mile
+// radius would incorrectly reject carriers who are genuinely on-site.
+const GEOFENCE_RADIUS_MI = 5.0;
 const detentionStore     = {};
 
 function haversineMilesServer(lat1, lng1, lat2, lng2) {
