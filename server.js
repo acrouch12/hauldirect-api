@@ -1108,6 +1108,12 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
         quantity: 1,
       }],
       subscription_data: { metadata: { userId, planId, billingCycle: billingCycle || "monthly" } },
+      // Managed Payments is Stripe's international merchant-of-record feature
+      // (indirect tax compliance across 80+ countries) — not relevant to a
+      // US-only domestic subscription business, and it requires product tax
+      // codes we don't need. Explicitly disabled here since some accounts
+      // now enable it by default.
+      managed_payments: { enabled: false },
       success_url: `${origin}/?stripe_checkout=success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${origin}/?stripe_checkout=cancelled`,
     });
