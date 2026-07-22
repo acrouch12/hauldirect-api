@@ -391,14 +391,19 @@ function mapLoadFields(body) {
 // POST /api/loads
 app.post("/api/loads", async (req, res) => {
   try {
+    // Server-controlled fields go AFTER the spread so they always win,
+    // regardless of what the frontend sends — previously this was reversed,
+    // meaning a raw Date.now() number from the frontend (e.g. 1784680773527)
+    // would silently overwrite the correct ISO date string here, causing
+    // "date/time field value out of range" and the whole insert to fail.
     const load = await db.createLoad({
+      ...mapLoadFields(req.body),
       id:           crypto.randomUUID(),
       status:       "open",
       carrier_id:   null,
       progress:     0,
       posted_at:    new Date().toISOString(),
       paid:         false,
-      ...mapLoadFields(req.body),
     });
     res.json({ load });
   } catch (err) {
