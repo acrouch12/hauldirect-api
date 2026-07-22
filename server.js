@@ -1204,10 +1204,27 @@ app.post("/api/stripe/pay-load", async (req, res) => {
     return res.status(400).json({ error: "shipperCustomerId, carrierStripeAccountId, amountCents, and loadId are required" });
   }
   try {
+    // A PaymentIntent isn't charged just by creating it — it has to be
+    // confirmed with an actual payment method. Since the shipper isn't
+    // actively present at checkout when a load is released (this happens
+    // later, triggered by the shipper clicking a button in the app, not
+    // during Stripe's own checkout flow), we retrieve their saved card from
+    // their subscription checkout and charge it directly (off_session).
+    const customer = await stripe.customers.retrieve(shipperCustomerId);
+    const paymentMethodId = customer.invoice_settings?.default_payment_method
+      || (await stripe.paymentMethods.list({ customer: shipperCustomerId, type: "card", limit: 1 })).data[0]?.id;
+
+    if (!paymentMethodId) {
+      return res.status(400).json({ error: "This shipper has no saved card on file yet — they need to complete a Stripe Checkout session first." });
+    }
+
     const paymentIntent = await stripe.paymentIntents.create({
       amount: amountCents,
       currency: "usd",
       customer: shipperCustomerId,
+      payment_method: paymentMethodId,
+      off_session: true,
+      confirm: true,
       transfer_data: { destination: carrierStripeAccountId },
       metadata: { loadId, quickPay: quickPay ? "true" : "false" },
       // With Standard connected accounts, an application_fee_amount can be
@@ -1218,6 +1235,33 @@ app.post("/api/stripe/pay-load", async (req, res) => {
   } catch (err) {
     console.error("Load payment error:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// STRIPE — QUICKPAY (real instant payout on a carrier's connected account)
+// The standard payout above already sends real money to the carrier's
+// Stripe balance — this specifically makes an already-transferred balance
+// pay out to their bank FASTER (minutes instead of Stripe's ~2 business
+// day standard schedule), for the 1.5% fee already shown in the app.
+// ================================================================
+app.post("/api/stripe/instant-payout", async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+  const { carrierStripeAccountId, amountCents } = req.body;
+  if (!carrierStripeAccountId || !amountCents) {
+    return res.status(400).json({ error: "carrierStripeAccountId and amountCents are required" });
+  }
+  try {
+    const payout = await stripe.payouts.create(
+      { amount: amountCents, currency: "usd", method: "instant" },
+      { stripeAccount: carrierStripeAccountId }
+    );
+    res.json({ payoutId: payout.id, status: payout.status, arrivalDate: payout.arrival_date });
+  } catch (err) {
+    console.error("Instant payout error:", err.message);
+    // Instant payout isn't available on every card/bank — a clear, specific
+    // error here (rather than a generic 500) helps the frontend explain why.
+    res.status(400).json({ error: err.message });
   }
 });
 
