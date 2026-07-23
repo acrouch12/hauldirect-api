@@ -24,6 +24,26 @@ if (process.env.NODE_ENV !== "production") require("dotenv").config();
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY.trim()) : null;
 const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID?.trim() || null; // no longer needed for Express Connect — kept only for backward compatibility
 const API_URL = process.env.API_URL || "https://hauldirect-api-production.up.railway.app"; // this backend's own public URL, used to build Stripe return links
+
+// Real, server-side login codes — replaces email-only login, where anyone
+// who knew a user's email could log into their full account with nothing
+// else required. Reuses the same EmailJS service/template already set up
+// for the frontend, called securely from the backend instead, so the code
+// is generated and checked server-side, not trusted from browser state.
+const emailjsNode = process.env.EMAILJS_PRIVATE_KEY ? require("@emailjs/nodejs") : null;
+if (emailjsNode) {
+  emailjsNode.init({
+    publicKey: process.env.EMAILJS_PUBLIC_KEY,
+    privateKey: process.env.EMAILJS_PRIVATE_KEY,
+  });
+}
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_1h4mak5";
+const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || "template_4m5qw9o";
+const loginCodes = {}; // { [email]: { code, expiresAt } } — simple in-memory store, fine at this scale
+
+function generateLoginCode() {
+  return String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
+}
 // Both your live site and test site currently share this one backend, so
 // Stripe needs to know how to send people back to whichever one they
 // actually started from — not just always production. This allowlist
@@ -74,9 +94,48 @@ const supabase = createClient(
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
-app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "PATCH"] }));
+// CORS was wide open (origin: "*") — meaning literally any website on the
+// internet could call this API directly from a visitor's browser. Restricted
+// to the actual known frontend origins, reusing the same allowlist already
+// built for Stripe redirects, plus localhost for local dev testing.
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || ALLOWED_FRONTEND_ORIGINS.includes(origin) || origin.startsWith("http://localhost")) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
+  methods: ["GET", "POST", "PUT", "DELETE", "PATCH"],
+}));
 
 const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
+// Real login security — separate, tighter limits since these guard actual
+// account access. loginCodeRequestLimiter stops someone spamming a target's
+// inbox with codes; loginCodeVerifyLimiter stops brute-forcing a 6-digit code.
+const loginCodeRequestLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5 });
+const loginCodeVerifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
+
+// Real, server-side operator authentication. Previously the operator PIN
+// only lived in the frontend's own JavaScript bundle — meaning it was
+// visible in plain text to anyone who opened browser dev tools and searched
+// the compiled code, and none of the operator-only endpoints (view all
+// users, suspend/delete accounts, resolve disputes) actually checked
+// anything server-side at all. Both are fixed here: the real PIN now only
+// ever lives in Railway's environment variables, and every operator-only
+// endpoint requires it on every single request, not just at initial unlock.
+const operatorPinLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
+const signupLimiter = rateLimit({ windowMs: 60 * 60 * 1000, max: 15 }); // prevent spam account creation
+function requireOperatorAuth(req, res, next) {
+  const providedPin = req.headers["x-operator-pin"];
+  if (!process.env.OPERATOR_PIN) {
+    return res.status(503).json({ error: "Operator access not configured on the server." });
+  }
+  if (!providedPin || providedPin !== process.env.OPERATOR_PIN) {
+    return res.status(401).json({ error: "Invalid or missing operator credentials." });
+  }
+  next();
+}
 
 // ================================================================
 // DATABASE HELPERS
@@ -191,7 +250,7 @@ const db = {
 // ================================================================
 
 // POST /api/auth/signup
-app.post("/api/auth/signup", async (req, res) => {
+app.post("/api/auth/signup", signupLimiter, async (req, res) => {
   try {
     const { name, email, role, company, equipmentType, truckDesc, maxWeight,
             dotNumber, mcNumber, verification, coiVerified, coiData,
@@ -240,11 +299,60 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
-// POST /api/auth/login
-app.post("/api/auth/login", async (req, res) => {
+// The old /api/auth/login (email-only, no code/password) has been removed
+// entirely — it's not enough to stop the frontend from calling it, since
+// anyone could still hit it directly (curl, Postman) and get a full user
+// record back with nothing but a guessed or known email address. Real
+// login now requires /api/auth/request-login-code followed by
+// /api/auth/verify-login-code, both below.
+
+// POST /api/auth/request-login-code — Step 1 of real login. Generates a
+// real code, stores it server-side (never trusting the browser with the
+// source of truth), and emails it using the same EmailJS template already
+// set up, sent securely from the backend this time.
+app.post("/api/auth/request-login-code", loginCodeRequestLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "email required" });
+    const user = await db.getUserByEmail(email);
+    // Deliberately vague response either way — confirming whether an email
+    // has an account at all is its own small information leak.
+    if (!user) return res.json({ sent: true });
+    if (user.suspended) return res.status(403).json({ error: "This account has been suspended. Contact support." });
+
+    const code = generateLoginCode();
+    loginCodes[email.toLowerCase()] = { code, expiresAt: Date.now() + 10 * 60 * 1000 };
+
+    if (emailjsNode) {
+      try {
+        await emailjsNode.send(EMAILJS_SERVICE_ID, EMAILJS_VERIFY_TEMPLATE, {
+          to_email: email, to_name: user.name, code,
+        });
+      } catch (emailErr) {
+        console.error("Login code email failed to send:", emailErr.message);
+      }
+    } else {
+      console.warn("EMAILJS_PRIVATE_KEY not set — login code generated but not emailed:", code);
+    }
+    res.json({ sent: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/verify-login-code — Step 2. Only returns the real user
+// record once the code is confirmed correct and not expired, server-side.
+app.post("/api/auth/verify-login-code", loginCodeVerifyLimiter, async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: "email and code are required" });
+    const key = email.toLowerCase();
+    const record = loginCodes[key];
+    if (!record) return res.status(400).json({ error: "No login code was requested for this email, or it already expired. Request a new one." });
+    if (Date.now() > record.expiresAt) { delete loginCodes[key]; return res.status(400).json({ error: "This code has expired. Request a new one." }); }
+    if (record.code !== String(code).trim()) return res.status(400).json({ error: "Incorrect code. Check your email and try again." });
+
+    delete loginCodes[key]; // one-time use
     const user = await db.getUserByEmail(email);
     if (!user) return res.status(404).json({ error: "No account found with that email." });
     if (user.suspended) return res.status(403).json({ error: "This account has been suspended. Contact support." });
@@ -632,8 +740,16 @@ app.post("/api/ratings", async (req, res) => {
 // OPERATOR ENDPOINTS
 // ================================================================
 
+// POST /api/operator/verify-pin — used only for the initial unlock screen.
+// Rate-limited since it's a PIN-guessing surface.
+app.post("/api/operator/verify-pin", operatorPinLimiter, (req, res) => {
+  if (!process.env.OPERATOR_PIN) return res.status(503).json({ error: "Operator access not configured on the server." });
+  const { pin } = req.body;
+  res.json({ valid: pin === process.env.OPERATOR_PIN });
+});
+
 // GET /api/operator/users  (all users for operator dashboard)
-app.get("/api/operator/users", async (req, res) => {
+app.get("/api/operator/users", requireOperatorAuth, async (req, res) => {
   try {
     const users = await db.getAllUsers();
     res.json({ users });
@@ -643,7 +759,7 @@ app.get("/api/operator/users", async (req, res) => {
 });
 
 // PATCH /api/operator/users/:id/suspend
-app.patch("/api/operator/users/:id/suspend", async (req, res) => {
+app.patch("/api/operator/users/:id/suspend", requireOperatorAuth, async (req, res) => {
   try {
     const user = await db.updateUser(req.params.id, { suspended: req.body.suspended });
     res.json({ user });
@@ -653,7 +769,7 @@ app.patch("/api/operator/users/:id/suspend", async (req, res) => {
 });
 
 // DELETE /api/operator/users/:id
-app.delete("/api/operator/users/:id", async (req, res) => {
+app.delete("/api/operator/users/:id", requireOperatorAuth, async (req, res) => {
   try {
     const { error } = await supabase.from("users").delete().eq("id", req.params.id);
     if (error) throw error;
@@ -879,7 +995,7 @@ app.post("/api/disputes", async (req, res) => {
 });
 
 // GET /api/disputes
-app.get("/api/disputes", async (req, res) => {
+app.get("/api/disputes", requireOperatorAuth, async (req, res) => {
   try {
     const { data } = await supabase.from("disputes").select("*").order("created_at", { ascending: false });
     res.json({ disputes: data || [] });
@@ -889,7 +1005,7 @@ app.get("/api/disputes", async (req, res) => {
 });
 
 // PATCH /api/disputes/:id
-app.patch("/api/disputes/:id", async (req, res) => {
+app.patch("/api/disputes/:id", requireOperatorAuth, async (req, res) => {
   try {
     const { data, error } = await supabase.from("disputes").update({ ...req.body, updated_at: new Date().toISOString() }).eq("id", req.params.id).select().single();
     if (error) throw error;
@@ -1050,7 +1166,7 @@ app.post("/api/waitlist/promo/:code/redeem", async (req, res) => {
 });
 
 // GET /api/waitlist  (operator only)
-app.get("/api/waitlist", async (req, res) => {
+app.get("/api/waitlist", requireOperatorAuth, async (req, res) => {
   try {
     const { data } = await supabase.from("waitlist").select("*").order("position");
     res.json({ waitlist: data || [] });
@@ -1060,7 +1176,7 @@ app.get("/api/waitlist", async (req, res) => {
 });
 
 // PATCH /api/waitlist/:id  (mark converted, promo_sent, etc)
-app.patch("/api/waitlist/:id", async (req, res) => {
+app.patch("/api/waitlist/:id", requireOperatorAuth, async (req, res) => {
   try {
     const { data, error } = await supabase.from("waitlist").update(req.body).eq("id", req.params.id).select().single();
     if (error) throw error;
@@ -1392,6 +1508,7 @@ app.get("/api/health", async (req, res) => {
     stripeKeyConfigured: !!process.env.STRIPE_SECRET_KEY,
     stripeConnectConfigured: !!stripe, // Express Connect only needs the Stripe secret key, not a Client ID
     stripeWebhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
+    secureLoginEmailConfigured: !!emailjsNode,
     aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
   });
 });
