@@ -12,7 +12,8 @@
     "express-rate-limit": "^7.4.0",
     "@supabase/supabase-js": "^2.45.4",
     "stripe": "^17.0.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "@emailjs/nodejs": "^2.0.2"
   },
   "engines": {
     "node": ">=18.0.0"
