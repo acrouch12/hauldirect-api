@@ -41,6 +41,37 @@ const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_1h4mak5";
 const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || "template_4m5qw9o";
 const loginCodes = {}; // { [email]: { code, expiresAt } } — simple in-memory store, fine at this scale
 
+// Real session tokens — proves who's making each request, not just at the
+// moment of login. Previously, once someone logged in, nothing carried that
+// proof forward: any subsequent request (like updating a load) only needed
+// to know that load's ID, with no check that the requester was actually the
+// shipper or carrier involved. UUIDs make this hard to exploit blindly, but
+// it's not the same as real protection. A session token is generated here
+// on every successful login/signup, sent back to the frontend once, and
+// required (plus checked against actual load/bid ownership) on sensitive
+// requests going forward.
+const sessionTokens = {}; // { [token]: { userId, expiresAt } }
+const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function issueSessionToken(userId) {
+  const token = crypto.randomBytes(32).toString("hex");
+  sessionTokens[token] = { userId, expiresAt: Date.now() + SESSION_DURATION_MS };
+  return token;
+}
+
+function requireUserAuth(req, res, next) {
+  const token = req.headers["x-session-token"];
+  if (!token || !sessionTokens[token]) {
+    return res.status(401).json({ error: "Not logged in, or your session has expired. Please log in again." });
+  }
+  if (Date.now() > sessionTokens[token].expiresAt) {
+    delete sessionTokens[token];
+    return res.status(401).json({ error: "Your session has expired. Please log in again." });
+  }
+  req.userId = sessionTokens[token].userId;
+  next();
+}
+
 function generateLoginCode() {
   return String(Math.floor(100000 + Math.random() * 900000)); // 6 digits
 }
@@ -292,7 +323,7 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
       created_at:       new Date().toISOString(),
     });
 
-    res.json({ user });
+    res.json({ user, sessionToken: issueSessionToken(user.id) });
   } catch (err) {
     console.error("Signup error:", err.message);
     res.status(500).json({ error: err.message });
@@ -356,7 +387,7 @@ app.post("/api/auth/verify-login-code", loginCodeVerifyLimiter, async (req, res)
     const user = await db.getUserByEmail(email);
     if (!user) return res.status(404).json({ error: "No account found with that email." });
     if (user.suspended) return res.status(403).json({ error: "This account has been suspended. Contact support." });
-    res.json({ user });
+    res.json({ user, sessionToken: issueSessionToken(user.id) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -544,8 +575,21 @@ app.get("/api/loads/:id", async (req, res) => {
 });
 
 // PATCH /api/loads/:id
-app.patch("/api/loads/:id", async (req, res) => {
+app.patch("/api/loads/:id", requireUserAuth, async (req, res) => {
   try {
+    const existing = await db.getLoadById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Load not found." });
+
+    const isOwningShipper = existing.shipper_id === req.userId;
+    const isAssignedCarrier = existing.carrier_id === req.userId;
+    // A carrier claiming a currently-open load (no carrier assigned yet) is
+    // legitimate — but only if they're assigning themselves, not someone else.
+    const isClaimingOpenLoad = !existing.carrier_id && req.body.carrierId === req.userId;
+
+    if (!isOwningShipper && !isAssignedCarrier && !isClaimingOpenLoad) {
+      return res.status(403).json({ error: "You don't have permission to update this load." });
+    }
+
     const load = await db.updateLoad(req.params.id, mapLoadFields(req.body));
     res.json({ load });
   } catch (err) {
