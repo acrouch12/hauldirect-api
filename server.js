@@ -37,7 +37,7 @@ if (emailjsNode) {
     privateKey: process.env.EMAILJS_PRIVATE_KEY,
   });
 }
-const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_1h4mak5";
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_o8cxfuw";
 const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || "template_4m5qw9o";
 const loginCodes = {}; // { [email]: { code, expiresAt } } — simple in-memory store, fine at this scale
 
@@ -749,6 +749,38 @@ app.post("/api/operator/verify-pin", operatorPinLimiter, (req, res) => {
 });
 
 // GET /api/operator/users  (all users for operator dashboard)
+// GET /api/users/directory — the general, public-facing user list used to
+// populate the site for every visitor (load board, nearby capacity, browsing
+// carriers/shippers). Returns only what's needed for that, with genuinely
+// sensitive fields stripped out. This used to just be /api/operator/users
+// itself, serving double duty — meaning EVERY visitor was getting each
+// other's full sensitive data (Stripe account IDs, business verification
+// documents, operator notes) with no protection at all, before today's
+// security pass. Now regular browsing uses this safe version, and the real
+// operator dashboard uses the separately protected endpoint below.
+app.get("/api/users/directory", async (req, res) => {
+  try {
+    const users = await db.getAllUsers();
+    const safe = users.map((u) => ({
+      id: u.id, name: u.name, role: u.role, company: u.company,
+      equipment_type: u.equipment_type, truck_desc: u.truck_desc, max_weight: u.max_weight,
+      dims: u.dims, loc: u.loc, current_zip: u.current_zip, ratings: u.ratings,
+      lanes: u.lanes, equipment_status: u.equipment_status, suspended: u.suspended,
+      trial_started_at: u.trial_started_at, complimentary: u.complimentary,
+      complimentary_expiry: u.complimentary_expiry, stripe_connected: u.stripe_connected,
+      payout: u.payout ? { connected: u.payout.connected, provider: u.payout.provider } : null,
+      billing_cycle: u.billing_cycle, requested_tier: u.requested_tier,
+      factoring_enabled: u.factoring_enabled, factoring_company: u.factoring_company,
+    }));
+    res.json({ users: safe });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/operator/users — full, unfiltered user data (Stripe account IDs,
+// business/COI verification documents, operator notes, everything) — only
+// for the real operator dashboard, protected below.
 app.get("/api/operator/users", requireOperatorAuth, async (req, res) => {
   try {
     const users = await db.getAllUsers();
