@@ -554,7 +554,7 @@ app.patch("/api/loads/:id", async (req, res) => {
 });
 
 // DELETE /api/loads/:id  (operator only)
-app.delete("/api/loads/:id", async (req, res) => {
+app.delete("/api/loads/:id", requireOperatorAuth, async (req, res) => {
   try {
     await db.deleteLoad(req.params.id);
     res.json({ deleted: true });
