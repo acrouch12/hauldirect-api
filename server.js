@@ -37,7 +37,7 @@ if (emailjsNode) {
     privateKey: process.env.EMAILJS_PRIVATE_KEY,
   });
 }
-const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_o8cxfuw";
+const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_1h4mak5";
 const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || "template_4m5qw9o";
 const loginCodes = {}; // { [email]: { code, expiresAt } } — simple in-memory store, fine at this scale
 
