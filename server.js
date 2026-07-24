@@ -1509,6 +1509,9 @@ app.get("/api/health", async (req, res) => {
     stripeConnectConfigured: !!stripe, // Express Connect only needs the Stripe secret key, not a Client ID
     stripeWebhookConfigured: !!process.env.STRIPE_WEBHOOK_SECRET,
     secureLoginEmailConfigured: !!emailjsNode,
+    emailjsPrivateKeyDebug: process.env.EMAILJS_PRIVATE_KEY
+      ? { present: true, length: process.env.EMAILJS_PRIVATE_KEY.length }
+      : { present: false }, // TEMPORARY — remove once this is solved
     aiVerificationConfigured: !!process.env.ANTHROPIC_API_KEY,
   });
 });
