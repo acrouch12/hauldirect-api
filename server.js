@@ -936,6 +936,37 @@ app.get("/api/operator/verification-bypass-status", requireOperatorAuth, (req, r
   res.json({ active: isVerificationBypassActive(), until: verificationBypassUntil });
 });
 
+// GET /api/operator/subscription-revenue — real, confirmed subscription
+// revenue actually collected via Stripe (not an estimate based on counting
+// active accounts x their tier price, like the existing Growth tab MRR).
+app.get("/api/operator/subscription-revenue", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("subscription_payments").select("*").order("paid_at", { ascending: false });
+    if (error) throw error;
+
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+    const totalRevenueCents = data.reduce((sum, p) => sum + p.amount_cents, 0);
+    const thisMonthCents = data.filter((p) => p.paid_at >= startOfMonth).reduce((sum, p) => sum + p.amount_cents, 0);
+
+    const byPlan = {};
+    for (const p of data) {
+      const key = p.plan_id || "unknown";
+      byPlan[key] = (byPlan[key] || 0) + p.amount_cents;
+    }
+
+    res.json({
+      totalRevenueCents,
+      thisMonthCents,
+      paymentCount: data.length,
+      byPlan,
+      recentPayments: data.slice(0, 20),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/operator/users  (all users for operator dashboard)
 // GET /api/users/directory — the general, public-facing user list used to
 // populate the site for every visitor (load board, nearby capacity, browsing
@@ -1662,6 +1693,27 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
             billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription },
             trial_started_at: new Date().toISOString(),
           }).eq("id", userId);
+        }
+        break;
+      }
+      case "invoice.payment_succeeded": {
+        // Real, confirmed revenue — fires for both the first payment and
+        // every renewal, only once Stripe has actually collected the money.
+        const invoice = event.data.object;
+        try {
+          const subscription = invoice.subscription
+            ? await stripe.subscriptions.retrieve(invoice.subscription)
+            : null;
+          await supabase.from("subscription_payments").upsert({
+            stripe_customer_id: invoice.customer,
+            stripe_invoice_id: invoice.id,
+            amount_cents: invoice.amount_paid,
+            plan_id: subscription?.metadata?.planId || null,
+            billing_cycle: subscription?.metadata?.billingCycle || null,
+            paid_at: new Date(invoice.status_transitions?.paid_at * 1000 || Date.now()).toISOString(),
+          }, { onConflict: "stripe_invoice_id" });
+        } catch (revErr) {
+          console.error("Could not record subscription payment:", revErr.message);
         }
         break;
       }
