@@ -369,7 +369,7 @@ app.post("/api/auth/request-login-code", loginCodeRequestLimiter, async (req, re
     if (emailjsNode) {
       try {
         await emailjsNode.send(EMAILJS_SERVICE_ID, EMAILJS_VERIFY_TEMPLATE, {
-          to_email: email, to_name: user.name, code,
+          to_email: email, user_name: user.name, verify_code: code, platform_name: "Direct Freight Co",
         });
       } catch (emailErr) {
         console.error("Login code email failed to send:", JSON.stringify(emailErr), emailErr.status, emailErr.text);
