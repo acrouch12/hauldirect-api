@@ -372,7 +372,7 @@ app.post("/api/auth/request-login-code", loginCodeRequestLimiter, async (req, re
           to_email: email, to_name: user.name, code,
         });
       } catch (emailErr) {
-        console.error("Login code email failed to send:", emailErr.message);
+        console.error("Login code email failed to send:", JSON.stringify(emailErr), emailErr.status, emailErr.text);
       }
     } else {
       console.warn("EMAILJS_PRIVATE_KEY not set — login code generated but not emailed:", code);
