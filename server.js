@@ -41,6 +41,17 @@ const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_1h4mak5";
 const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || "template_4m5qw9o";
 const loginCodes = {}; // { [email]: { code, expiresAt } } — simple in-memory store, fine at this scale
 
+// Operator-controlled testing toggle — lets ANY code (or none at all) work
+// for login while enabled, so testing doesn't require checking real email
+// every time. This is genuinely powerful and dangerous if left on by
+// accident (it would mean literally anyone could log into any account), so
+// it auto-expires after 1 hour rather than staying on indefinitely, and
+// every toggle is logged server-side for accountability.
+let verificationBypassUntil = null; // timestamp, or null if off
+function isVerificationBypassActive() {
+  return verificationBypassUntil !== null && Date.now() < verificationBypassUntil;
+}
+
 // Real session tokens — proves who's making each request, not just at the
 // moment of login. Previously, once someone logged in, nothing carried that
 // proof forward: any subsequent request (like updating a load) only needed
@@ -403,7 +414,9 @@ app.post("/api/auth/request-login-code", loginRequestLimiter, async (req, res) =
     const code = generateLoginCode();
     loginCodes[email.toLowerCase()] = { code, expiresAt: Date.now() + 10 * 60 * 1000 };
 
-    if (emailjsNode) {
+    if (isVerificationBypassActive()) {
+      console.log(`Verification bypass active — skipped sending real code for ${email} (any code will work).`);
+    } else if (emailjsNode) {
       try {
         await emailjsNode.send(EMAILJS_SERVICE_ID, EMAILJS_VERIFY_TEMPLATE, {
           to_email: email, user_name: user.name, verify_code: code, platform_name: "Direct Freight Co",
@@ -414,7 +427,7 @@ app.post("/api/auth/request-login-code", loginRequestLimiter, async (req, res) =
     } else {
       console.warn("EMAILJS_PRIVATE_KEY not set — login code generated but not emailed:", code);
     }
-    res.json({ sent: true });
+    res.json({ sent: true, bypassActive: isVerificationBypassActive() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -427,12 +440,18 @@ app.post("/api/auth/verify-login-code", loginVerifyLimiter, async (req, res) => 
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: "email and code are required" });
     const key = email.toLowerCase();
-    const record = loginCodes[key];
-    if (!record) return res.status(400).json({ error: "No login code was requested for this email, or it already expired. Request a new one." });
-    if (Date.now() > record.expiresAt) { delete loginCodes[key]; return res.status(400).json({ error: "This code has expired. Request a new one." }); }
-    if (record.code !== String(code).trim()) return res.status(400).json({ error: "Incorrect code. Check your email and try again." });
 
-    delete loginCodes[key]; // one-time use
+    if (isVerificationBypassActive()) {
+      // Testing bypass active — any code works, real code check skipped.
+      delete loginCodes[key];
+    } else {
+      const record = loginCodes[key];
+      if (!record) return res.status(400).json({ error: "No login code was requested for this email, or it already expired. Request a new one." });
+      if (Date.now() > record.expiresAt) { delete loginCodes[key]; return res.status(400).json({ error: "This code has expired. Request a new one." }); }
+      if (record.code !== String(code).trim()) return res.status(400).json({ error: "Incorrect code. Check your email and try again." });
+      delete loginCodes[key]; // one-time use
+    }
+
     const user = await db.getUserByEmail(email);
     if (!user) return res.status(404).json({ error: "No account found with that email." });
     if (user.suspended) return res.status(403).json({ error: "This account has been suspended. Contact support." });
@@ -852,6 +871,26 @@ app.post("/api/operator/clear-login-limit", requireOperatorAuth, (req, res) => {
   delete loginVerifyAttempts[key];
   delete loginCodes[key]; // also clear any pending code so they can request a genuinely fresh one
   res.json({ cleared: true, email });
+});
+
+// POST /api/operator/toggle-verification-bypass — testing-only switch that
+// lets any code work for login. Auto-expires after 1 hour regardless of
+// whether anyone remembers to turn it back off, since leaving this on by
+// accident would mean anyone could log into any account.
+app.post("/api/operator/toggle-verification-bypass", requireOperatorAuth, (req, res) => {
+  const { enabled } = req.body;
+  if (enabled) {
+    verificationBypassUntil = Date.now() + 60 * 60 * 1000; // 1 hour
+    console.warn(`⚠️  Login verification bypass ENABLED by operator until ${new Date(verificationBypassUntil).toISOString()}`);
+  } else {
+    verificationBypassUntil = null;
+    console.log("Login verification bypass disabled by operator.");
+  }
+  res.json({ active: isVerificationBypassActive(), until: verificationBypassUntil });
+});
+
+app.get("/api/operator/verification-bypass-status", requireOperatorAuth, (req, res) => {
+  res.json({ active: isVerificationBypassActive(), until: verificationBypassUntil });
 });
 
 // GET /api/operator/users  (all users for operator dashboard)
