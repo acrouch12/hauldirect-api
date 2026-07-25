@@ -154,10 +154,47 @@ app.use(cors({
 
 const verifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
 // Real login security — separate, tighter limits since these guard actual
-// account access. loginCodeRequestLimiter stops someone spamming a target's
-// inbox with codes; loginCodeVerifyLimiter stops brute-forcing a 6-digit code.
-const loginCodeRequestLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5 });
-const loginCodeVerifyLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10 });
+// account access. Previously keyed by IP address (express-rate-limit's
+// default) — which meant an operator couldn't clear a limit "for this
+// person" the way you'd actually want, since IP isn't necessarily even
+// visible or unique to one person. Rebuilt as a simple, custom, email-keyed
+// tracker instead — same protection, but genuinely clearable per-account
+// from the operator dashboard when someone's in a hurry and legitimately
+// needs back in sooner.
+const loginRequestAttempts = {}; // { [email]: { count, windowStart } }
+const loginVerifyAttempts = {};  // { [email]: { count, windowStart } }
+const LOGIN_LIMIT_WINDOW_MS = 15 * 60 * 1000;
+
+function checkAndTrackLimit(store, email, maxAttempts) {
+  const key = email.toLowerCase();
+  const now = Date.now();
+  const record = store[key];
+  if (!record || now - record.windowStart > LOGIN_LIMIT_WINDOW_MS) {
+    store[key] = { count: 1, windowStart: now };
+    return true;
+  }
+  if (record.count >= maxAttempts) return false;
+  record.count += 1;
+  return true;
+}
+
+function loginRequestLimiter(req, res, next) {
+  const email = req.body?.email;
+  if (!email) return next();
+  if (!checkAndTrackLimit(loginRequestAttempts, email, 5)) {
+    return res.status(429).json({ error: "Too many code requests for this email. Please wait about 15 minutes, or ask the operator to clear it for you." });
+  }
+  next();
+}
+
+function loginVerifyLimiter(req, res, next) {
+  const email = req.body?.email;
+  if (!email) return next();
+  if (!checkAndTrackLimit(loginVerifyAttempts, email, 10)) {
+    return res.status(429).json({ error: "Too many attempts for this email. Please wait about 15 minutes, or ask the operator to clear it for you." });
+  }
+  next();
+}
 
 // Real, server-side operator authentication. Previously the operator PIN
 // only lived in the frontend's own JavaScript bundle — meaning it was
@@ -353,7 +390,7 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
 // real code, stores it server-side (never trusting the browser with the
 // source of truth), and emails it using the same EmailJS template already
 // set up, sent securely from the backend this time.
-app.post("/api/auth/request-login-code", loginCodeRequestLimiter, async (req, res) => {
+app.post("/api/auth/request-login-code", loginRequestLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "email required" });
@@ -385,7 +422,7 @@ app.post("/api/auth/request-login-code", loginCodeRequestLimiter, async (req, re
 
 // POST /api/auth/verify-login-code — Step 2. Only returns the real user
 // record once the code is confirmed correct and not expired, server-side.
-app.post("/api/auth/verify-login-code", loginCodeVerifyLimiter, async (req, res) => {
+app.post("/api/auth/verify-login-code", loginVerifyLimiter, async (req, res) => {
   try {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ error: "email and code are required" });
@@ -802,6 +839,19 @@ app.post("/api/operator/verify-pin", operatorPinLimiter, (req, res) => {
   if (!process.env.OPERATOR_PIN) return res.status(503).json({ error: "Operator access not configured on the server." });
   const { pin } = req.body;
   res.json({ valid: pin === process.env.OPERATOR_PIN });
+});
+
+// POST /api/operator/clear-login-limit — lets you unblock a real shipper or
+// carrier immediately, instead of them waiting out the full 15-minute
+// window, when they're legitimately in a hurry (not being brute-forced).
+app.post("/api/operator/clear-login-limit", requireOperatorAuth, (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "email is required" });
+  const key = email.toLowerCase();
+  delete loginRequestAttempts[key];
+  delete loginVerifyAttempts[key];
+  delete loginCodes[key]; // also clear any pending code so they can request a genuinely fresh one
+  res.json({ cleared: true, email });
 });
 
 // GET /api/operator/users  (all users for operator dashboard)
