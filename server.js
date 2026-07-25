@@ -718,6 +718,49 @@ app.patch("/api/bids/:id", async (req, res) => {
 });
 
 // ================================================================
+// REVIEWS / FEEDBACK — previously only stored in a plain in-browser array,
+// never the real database, meaning reviews were lost on every refresh and
+// invisible across different devices or sessions.
+// ================================================================
+
+// POST /api/feedback — open to anyone submitting a review, no auth required
+app.post("/api/feedback", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("reviews").insert({
+      user_name: req.body.userName, user_email: req.body.userEmail, user_role: req.body.userRole,
+      stars: req.body.stars, what_to_add: req.body.whatToAdd, easier: req.body.easier,
+      problems: req.body.problems, general: req.body.general,
+    }).select().single();
+    if (error) throw error;
+    res.json({ review: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/feedback — operator only, since it includes names/emails
+app.get("/api/feedback", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("reviews").select("*").order("submitted_at", { ascending: false });
+    if (error) throw error;
+    res.json({ reviews: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/feedback/:id — operator only
+app.delete("/api/feedback/:id", requireOperatorAuth, async (req, res) => {
+  try {
+    const { error } = await supabase.from("reviews").delete().eq("id", req.params.id);
+    if (error) throw error;
+    res.json({ deleted: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
 // MESSAGES ENDPOINTS
 // ================================================================
 
@@ -1541,6 +1584,28 @@ app.post("/api/stripe/pay-load", async (req, res) => {
     res.json({ paymentIntentId: paymentIntent.id, status: paymentIntent.status });
   } catch (err) {
     console.error("Load payment error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// STRIPE — BILLING PORTAL (real payment method updates, invoice history,
+// and subscription management, all handled by Stripe's own hosted page —
+// replaces the previous "email us to update your card" placeholder).
+// ================================================================
+app.post("/api/stripe/create-billing-portal-session", requireUserAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+  const { customerId, returnOrigin } = req.body;
+  if (!customerId) return res.status(400).json({ error: "customerId is required" });
+  try {
+    const origin = safeFrontendOrigin(returnOrigin);
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${origin}/`,
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error("Billing portal session error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
