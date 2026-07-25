@@ -124,16 +124,28 @@ const supabase = createClient(
 );
 
 const app = express();
-app.use(express.json({ limit: "10mb" }));
+// Stripe webhook signature verification requires the raw, unparsed request
+// body — but the global JSON parser below was consuming and parsing it on
+// every request before the webhook route ever saw it, silently breaking
+// every webhook event. Skipping JSON parsing specifically for that one path.
+app.use((req, res, next) => {
+  if (req.path === "/api/webhooks/stripe") return next();
+  express.json({ limit: "10mb" })(req, res, next);
+});
 // CORS was wide open (origin: "*") — meaning literally any website on the
 // internet could call this API directly from a visitor's browser. Restricted
 // to the actual known frontend origins, reusing the same allowlist already
 // built for Stripe redirects, plus localhost for local dev testing.
+app.set("trust proxy", 1); // Railway sits behind a proxy — required for
+// express-rate-limit to correctly identify real client IPs instead of
+// throwing on every request (was flooding the logs with ValidationErrors).
+
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin || ALLOWED_FRONTEND_ORIGINS.includes(origin) || origin.startsWith("http://localhost")) {
       callback(null, true);
     } else {
+      console.warn("CORS rejected origin:", origin, "— allowed origins are:", ALLOWED_FRONTEND_ORIGINS);
       callback(new Error("Not allowed by CORS"));
     }
   },
