@@ -562,6 +562,7 @@ const LOAD_FIELD_MAP = {
   returnTripFee: "return_trip_fee", returnTripNote: "return_trip_note",
   returnTripRequestedAt: "return_trip_requested_at", returnTripResolvedAt: "return_trip_resolved_at",
   additionalPayFee: "additional_pay_fee",
+  bolPackageCount: "bol_package_count", bolPackageType: "bol_package_type", bolSentAt: "bol_sent_at",
   // Already valid snake_case / single-word column names — pass through unchanged
   origin: "origin", destination: "destination", miles: "miles", weight: "weight",
   price: "price", description: "description", dims: "dims", equipmentType: "equipment_type",
@@ -588,6 +589,7 @@ const LOAD_VALID_COLUMNS = new Set([
   "special", "cancelled_at", "cancelled_by", "cancel_reason", "cancel_history", "documents", "trailer_length",
   "return_trip_status", "return_trip_reason", "return_trip_fee", "return_trip_note",
   "return_trip_requested_at", "return_trip_resolved_at", "additional_pay_fee",
+  "bol_package_count", "bol_package_type", "bol_sent_at",
 ]);
 
 function mapLoadFields(body) {
