@@ -1367,63 +1367,16 @@ app.patch("/api/disputes/:id", requireOperatorAuth, async (req, res) => {
   }
 });
 
-// POST /api/disputes/:id/release-payment — operator resolves a dispute by
-// actually releasing real payment to the carrier, when the shipper hasn't
-// (or won't) click their own release button. Looks up the shipper's saved
-// card and the carrier's connected payout account server-side, since the
-// operator dashboard doesn't have that data the way the shipper's own app
-// does, then processes a genuine Stripe charge — not just a database flag.
-app.post("/api/disputes/:id/release-payment", requireOperatorAuth, async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
-  try {
-    const { data: dispute, error: disputeErr } = await supabase.from("disputes").select("*").eq("id", req.params.id).single();
-    if (disputeErr || !dispute) throw new Error("Dispute not found");
-    if (!dispute.load_id) throw new Error("This dispute has no associated load ID to release payment on.");
-
-    const { data: load, error: loadErr } = await supabase.from("loads").select("*").eq("id", dispute.load_id).single();
-    if (loadErr || !load) throw new Error("Could not find the load associated with this dispute.");
-    if (!load.trucker_id) throw new Error("This load has no assigned carrier to pay.");
-
-    const { data: shipper, error: shipperErr } = await supabase.from("users").select("*").eq("id", load.shipper_id).single();
-    if (shipperErr || !shipper) throw new Error("Could not find the shipper on this load.");
-    const { data: carrier, error: carrierErr } = await supabase.from("users").select("*").eq("id", load.trucker_id).single();
-    if (carrierErr || !carrier) throw new Error("Could not find the carrier on this load.");
-
-    const shipperCustomerId = shipper.billing?.stripeCustomerId;
-    const carrierStripeAccountId = carrier.payout?.stripeAccountId;
-    if (!shipperCustomerId) throw new Error("This shipper has no payment method on file — cannot process a real charge.");
-    if (!carrierStripeAccountId) throw new Error("This carrier hasn't connected a Stripe payout account — cannot send them a real payment.");
-
-    const customer = await stripe.customers.retrieve(shipperCustomerId);
-    const paymentMethodId = customer.invoice_settings?.default_payment_method
-      || (await stripe.paymentMethods.list({ customer: shipperCustomerId, type: "card", limit: 1 })).data[0]?.id;
-    if (!paymentMethodId) throw new Error("This shipper has no saved card on file yet.");
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(load.price * 100),
-      currency: "usd",
-      customer: shipperCustomerId,
-      payment_method: paymentMethodId,
-      off_session: true,
-      confirm: true,
-      transfer_data: { destination: carrierStripeAccountId },
-      metadata: { loadId: load.id, disputeId: dispute.id, operatorReleased: "true" },
-    });
-
-    await supabase.from("loads").update({ paid: true, paid_at: new Date().toISOString() }).eq("id", load.id);
-    const resolutionNote = req.body.resolution?.trim()
-      ? `${req.body.resolution.trim()} [Real payment released by operator via Stripe on ${new Date().toLocaleDateString()}]`
-      : `Real payment released by operator via Stripe on ${new Date().toLocaleDateString()} to resolve this dispute.`;
-    const { data: updatedDispute } = await supabase.from("disputes").update({
-      status: "resolved", resolution: resolutionNote, operator_notes: req.body.notes || null, updated_at: new Date().toISOString(),
-    }).eq("id", dispute.id).select().single();
-
-    res.json({ dispute: updatedDispute, paymentIntentId: paymentIntent.id, status: paymentIntent.status });
-  } catch (err) {
-    console.error("Operator dispute payment release failed:", err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
+// Note: this file previously had a
+// POST /api/disputes/:id/release-payment endpoint, letting an operator
+// unilaterally move real payment on a disputed load. It was deliberately
+// removed — the Terms of Service state disputes are resolved directly
+// between the parties, with funds releasing once both confirm resolution.
+// An operator unilaterally deciding to release payment ran ahead of what
+// the platform's own terms actually promise, and edged closer to acting as
+// a decision-maker in user disputes rather than a technical facilitator.
+// Payment release for a disputed load now only ever happens through the
+// shipper's own release action, same as any other load.
 
 // ================================================================
 // SAFERWATCH INSURANCE MONITORING
