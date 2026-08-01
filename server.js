@@ -1247,6 +1247,28 @@ setInterval(checkAllCarrierInsurance, 24 * 60 * 60 * 1000);
 // Detention tracking + live position tracking
 const positionStore = {}; // { [loadId]: { lat, lng, updatedAt, carrierId } }
 
+// TESTING TOOL — lets an operator backdate a load's recorded arrival time,
+// so the real calcDetention() logic runs against real elapsed time (just
+// simulated instead of actually waited-out) — genuinely useful for
+// confirming detention billing works correctly without sitting at a real
+// facility for 2+ hours. Never exposed to shippers or carriers.
+app.post("/api/operator/testing/simulate-detention", requireOperatorAuth, (req, res) => {
+  const { loadId, hoursAgo } = req.body;
+  if (!loadId || hoursAgo == null) return res.status(400).json({ error: "loadId and hoursAgo are required" });
+  const arrivalAt = Date.now() - (Number(hoursAgo) * 60 * 60 * 1000);
+  detentionStore[loadId] = {
+    loadId, carrierId: detentionStore[loadId]?.carrierId || null,
+    facilityLat: detentionStore[loadId]?.facilityLat || 0, facilityLng: detentionStore[loadId]?.facilityLng || 0,
+    arrivalAt, departureAt: null, charged: false,
+  };
+  const detention = calcDetention(arrivalAt, Date.now());
+  res.json({
+    loadId, arrivalAt, simulatedHoursAgo: Number(hoursAgo),
+    detentionMinutes: detention.billMin, detentionAmount: detention.amount,
+    note: "This backdates the arrival timestamp for testing only — no real GPS check-in happened. Check the load's real detention display in the app to confirm it reflects this correctly.",
+  });
+});
+
 app.post("/api/tracking/ping", async (req, res) => {
   const { loadId, carrierId, lat, lng, facilityLat, facilityLng } = req.body;
   if (!loadId || lat == null || lng == null || facilityLat == null || facilityLng == null)
