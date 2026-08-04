@@ -582,6 +582,7 @@ const LOAD_FIELD_MAP = {
   returnTripRequestedAt: "return_trip_requested_at", returnTripResolvedAt: "return_trip_resolved_at",
   additionalPayFee: "additional_pay_fee",
   bolPackageCount: "bol_package_count", bolPackageType: "bol_package_type", bolSentAt: "bol_sent_at",
+  trackingStartedAt: "tracking_started_at",
   // Already valid snake_case / single-word column names — pass through unchanged
   origin: "origin", destination: "destination", miles: "miles", weight: "weight",
   price: "price", description: "description", dims: "dims", equipmentType: "equipment_type",
@@ -609,6 +610,7 @@ const LOAD_VALID_COLUMNS = new Set([
   "return_trip_status", "return_trip_reason", "return_trip_fee", "return_trip_note",
   "return_trip_requested_at", "return_trip_resolved_at", "additional_pay_fee",
   "bol_package_count", "bol_package_type", "bol_sent_at",
+  "tracking_started_at",
 ]);
 
 function mapLoadFields(body) {
@@ -1382,19 +1384,57 @@ app.post("/api/tracking/ping", async (req, res) => {
 
   const distMiles = haversineMilesServer(lat, lng, facilityLat, facilityLng);
   const insideGeofence = distMiles <= GEOFENCE_RADIUS_MI;
+
+  // Real, persistent location history — every ping, not just the current
+  // position — so a full trail exists later if it's ever needed to review
+  // a dispute or question about where a carrier actually was.
+  supabase.from("location_pings").insert({
+    load_id: loadId, carrier_id: carrierId || null, lat, lng,
+    dist_miles: parseFloat(distMiles.toFixed(3)), inside_geofence: insideGeofence,
+  }).then(({ error }) => { if (error) console.warn("Location ping not saved to DB:", error.message); });
+
   let record = detentionStore[loadId];
   if (insideGeofence && !record) {
-    record = { loadId, carrierId, facilityLat, facilityLng, arrivalAt: now, departureAt: null, charged: false };
+    record = { loadId, carrierId, facilityLat, facilityLng, arrivalAt: now, departureAt: null, charged: false, arrivalLat: lat, arrivalLng: lng };
     detentionStore[loadId] = record;
+    // Persist the real arrival event to the load itself, not just memory
+    supabase.from("loads").update({
+      detention_arrival_at: new Date(now).toISOString(), detention_arrival_lat: lat, detention_arrival_lng: lng,
+    }).eq("id", loadId).then(({ error }) => { if (error) console.warn("Detention arrival not saved to DB:", error.message); });
   }
   if (!insideGeofence && record && !record.departureAt) {
     record.departureAt = now;
+    record.departureLat = lat;
+    record.departureLng = lng;
     const { amount } = calcDetention(record.arrivalAt, now);
     record.detentionAmount = amount;
     record.charged = amount > 0;
+    // Persist the real departure event too
+    supabase.from("loads").update({
+      detention_departure_at: new Date(now).toISOString(), detention_departure_lat: lat, detention_departure_lng: lng,
+    }).eq("id", loadId).then(({ error }) => { if (error) console.warn("Detention departure not saved to DB:", error.message); });
   }
   const detention = record ? calcDetention(record.arrivalAt, record.departureAt || now) : null;
   res.json({ loadId, distMiles: parseFloat(distMiles.toFixed(3)), insideGeofence, arrivalAt: record?.arrivalAt || null, departureAt: record?.departureAt || null, freeWindowExpired: record ? (now - record.arrivalAt) > FREE_WINDOW_MS : false, detentionActive: record && !record.departureAt && (now - record.arrivalAt) > FREE_WINDOW_MS, detentionMinutes: detention?.billMin || 0, detentionAmount: detention?.amount || 0, charged: record?.charged || false });
+});
+
+// GET /api/operator/load-history/:loadId — the real, persisted arrival/
+// departure record and full GPS trail for a load, for reviewing a
+// detention dispute or any question about where a carrier actually was.
+// Unlike the in-memory detentionStore, this survives server restarts.
+app.get("/api/operator/load-history/:loadId", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data: load, error: loadErr } = await supabase.from("loads")
+      .select("id, detention_arrival_at, detention_arrival_lat, detention_arrival_lng, detention_departure_at, detention_departure_lat, detention_departure_lng, picked_up_at, delivered_at, tracking_started_at")
+      .eq("id", req.params.loadId).single();
+    if (loadErr) throw loadErr;
+    const { data: pings, error: pingsErr } = await supabase.from("location_pings")
+      .select("*").eq("load_id", req.params.loadId).order("created_at", { ascending: true });
+    if (pingsErr) throw pingsErr;
+    res.json({ load, pings: pings || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get("/api/tracking/status/:loadId", (req, res) => {
@@ -1426,8 +1466,17 @@ app.post("/api/tracking/checkout", (req, res) => {
 
 // Real-time carrier GPS position — used by shipper's live tracking map.
 // Returns null/notFound until the carrier has tapped "Start tracking" at least once.
-app.get("/api/tracking/position/:loadId", (req, res) => {
-  const pos = positionStore[req.params.loadId];
+app.get("/api/tracking/position/:loadId", async (req, res) => {
+  let pos = positionStore[req.params.loadId];
+  // Falls back to the real, persisted ping history if the in-memory cache
+  // doesn't have it — e.g. right after a server restart, before any new
+  // ping has come in yet to repopulate the memory-only store.
+  if (!pos) {
+    const { data } = await supabase.from("location_pings")
+      .select("lat, lng, carrier_id, created_at")
+      .eq("load_id", req.params.loadId).order("created_at", { ascending: false }).limit(1).single();
+    if (data) pos = { lat: data.lat, lng: data.lng, carrierId: data.carrier_id, updatedAt: new Date(data.created_at).getTime() };
+  }
   if (!pos) return res.json({ loadId: req.params.loadId, hasPosition: false });
   const ageMs = Date.now() - pos.updatedAt;
   res.json({
@@ -1909,9 +1958,35 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
         const session = event.data.object;
         const userId = session.client_reference_id;
         if (userId) {
+          // The card's real last4/brand/expiry were never actually being
+          // fetched here — billing.connected was set true, but nothing
+          // populated the fields the UI displays, which is why every
+          // account showed "Card ending in ····" regardless of what card
+          // was actually used.
+          let cardDetails = {};
+          try {
+            const customer = await stripe.customers.retrieve(session.customer, {
+              expand: ["invoice_settings.default_payment_method"],
+            });
+            let paymentMethod = customer.invoice_settings?.default_payment_method;
+            if (!paymentMethod || typeof paymentMethod === "string") {
+              const methods = await stripe.paymentMethods.list({ customer: session.customer, type: "card", limit: 1 });
+              paymentMethod = methods.data[0] || null;
+            }
+            if (paymentMethod?.card) {
+              cardDetails = {
+                brand: paymentMethod.card.brand,
+                last4: paymentMethod.card.last4,
+                exp: `${String(paymentMethod.card.exp_month).padStart(2, "0")}/${String(paymentMethod.card.exp_year).slice(-2)}`,
+              };
+            }
+          } catch (cardErr) {
+            console.warn("Could not fetch real card details after checkout:", cardErr.message);
+          }
+
           await supabase.from("users").update({
             stripe_connected: true,
-            billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription },
+            billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription, ...cardDetails },
             trial_started_at: new Date().toISOString(),
           }).eq("id", userId);
         }
