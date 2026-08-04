@@ -39,6 +39,7 @@ if (emailjsNode) {
 }
 const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_1h4mak5";
 const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || "template_4m5qw9o";
+const EMAILJS_BAN_EVASION_TEMPLATE = process.env.EMAILJS_BAN_EVASION_TEMPLATE || "YOUR_BAN_EVASION_TEMPLATE"; // create this template in EmailJS
 const loginCodes = {}; // { [email]: { code, expiresAt } } — simple in-memory store, fine at this scale
 
 // Operator-controlled testing toggle — lets ANY code (or none at all) work
@@ -1047,6 +1048,25 @@ app.patch("/api/operator/users/:id/suspend", requireOperatorAuth, async (req, re
   }
 });
 
+// PATCH /api/operator/users/:id/terminate-permanently — distinct from both
+// suspend (temporary) and delete (removes the row entirely). This keeps
+// the account's MC/DOT number on file specifically so future signups can
+// be checked against it — a hard delete would destroy the very data
+// needed to catch someone trying to re-register after a permanent ban.
+app.patch("/api/operator/users/:id/terminate-permanently", requireOperatorAuth, async (req, res) => {
+  try {
+    const user = await db.updateUser(req.params.id, {
+      permanently_banned: true,
+      suspended: true,
+      ban_reason: req.body.reason || null,
+      banned_at: new Date().toISOString(),
+    });
+    res.json({ user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // DELETE /api/operator/users/:id
 app.delete("/api/operator/users/:id", requireOperatorAuth, async (req, res) => {
   try {
@@ -1103,12 +1123,55 @@ function calcDetention(arrivalAt, departureAt) {
   return { dwellMs, billMin, amount };
 }
 
+// Checks a newly-verified MC/DOT number against every permanently-banned
+// account on file. MC/DOT numbers are persistent, real-world identifiers —
+// unlike an email address, someone evading a ban can't easily get a new
+// one — so an exact match here is a genuinely strong signal, not a guess.
+async function checkBanEvasion(mcNumber, dotNumber) {
+  const cleanMc = mcNumber ? String(mcNumber).replace(/\D/g, "") : null;
+  const cleanDot = dotNumber ? String(dotNumber).replace(/\D/g, "") : null;
+  if (!cleanMc && !cleanDot) return null;
+
+  const { data: bannedUsers } = await supabase.from("users").select("id, name, company, mc_number, dot_number, ban_reason, banned_at").eq("permanently_banned", true);
+  if (!bannedUsers || !bannedUsers.length) return null;
+
+  const match = bannedUsers.find((u) =>
+    (cleanMc && u.mc_number && String(u.mc_number).replace(/\D/g, "") === cleanMc) ||
+    (cleanDot && u.dot_number && String(u.dot_number).replace(/\D/g, "") === cleanDot)
+  );
+  return match || null;
+}
+
 app.get("/api/carrier-verify", verifyLimiter, async (req, res) => {
   const { mc, dot } = req.query;
   if (!mc && !dot) return res.status(400).json({ error: "Provide mc or dot" });
   try {
     const fmcsaData = await fetchFmcsa({ mc, dot });
-    res.json(mergeCarrierData(fmcsaData, null));
+    const result = mergeCarrierData(fmcsaData, null);
+
+    const banMatch = await checkBanEvasion(result.mcNumber, result.dotNumber);
+    if (banMatch) {
+      result.banEvasionDetected = true;
+      console.warn("BAN EVASION ATTEMPT DETECTED:", { mcNumber: result.mcNumber, dotNumber: result.dotNumber, previouslyBannedAccount: banMatch.id, previousBanReason: banMatch.ban_reason });
+      if (emailjsNode) {
+        try {
+          await emailjsNode.send(EMAILJS_SERVICE_ID, EMAILJS_BAN_EVASION_TEMPLATE, {
+            to_email: "ashton@directfreightco.com",
+            mc_number: result.mcNumber || "N/A",
+            dot_number: result.dotNumber || "N/A",
+            legal_name: result.legalName || "Unknown",
+            previous_ban_reason: banMatch.ban_reason || "Not recorded",
+            previous_account_id: banMatch.id,
+          });
+        } catch (emailErr) {
+          console.error("Ban evasion alert email failed to send:", JSON.stringify(emailErr));
+        }
+      } else {
+        console.warn("EMAILJS_PRIVATE_KEY not set — ban evasion detected but not emailed. Check server logs for details.");
+      }
+    }
+
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
