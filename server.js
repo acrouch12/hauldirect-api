@@ -888,11 +888,31 @@ app.post("/api/ratings", async (req, res) => {
       role:           req.body.role,
       created_at:     new Date().toISOString(),
     });
-    // Update user's ratings array
-    const ratings = await db.getRatingsForUser(req.body.ratedUserId);
-    await db.updateUser(req.body.ratedUserId, {
-      ratings: ratings.map((r) => r.stars),
-    });
+
+    const ratedId = req.body.ratedUserId;
+    const isTeamMember = typeof ratedId === "string" && ratedId.startsWith("cm");
+
+    if (isTeamMember) {
+      // Company/fleet team members live nested inside their corp's own
+      // "lanes" field, not as their own row in users — so updating their
+      // cached ratings means finding the parent corp and updating that
+      // member's entry within the array, not a top-level user update.
+      const { data: corps } = await supabase.from("users").select("id, lanes").not("lanes", "is", null);
+      const parentCorp = (corps || []).find((c) => Array.isArray(c.lanes) && c.lanes.some((m) => m.id === ratedId));
+      if (parentCorp) {
+        const allRatingsForMember = await db.getRatingsForUser(ratedId);
+        const updatedLanes = parentCorp.lanes.map((m) =>
+          m.id === ratedId ? { ...m, ratings: allRatingsForMember.map((r) => r.stars) } : m
+        );
+        await supabase.from("users").update({ lanes: updatedLanes }).eq("id", parentCorp.id);
+      } else {
+        console.warn("Rating saved, but no parent corp found for team member:", ratedId);
+      }
+    } else {
+      const ratings = await db.getRatingsForUser(ratedId);
+      await db.updateUser(ratedId, { ratings: ratings.map((r) => r.stars) });
+    }
+
     res.json({ rating });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1870,6 +1890,34 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
 // reasoning as the chatbot proxy did — this can never work as a direct
 // browser call to api.anthropic.com once deployed.
 // ================================================================
+// ================================================================
+// NAIC INSURER REGISTRY — a real, genuine reference dataset pulled
+// directly from NAIC's own official "Listing of Companies" publication
+// (content.naic.org), covering major national insurers and all Ohio-based
+// insurers. Used to cross-check a COI's stated NAIC number against the
+// actual, real registry — catching a fabricated or mismatched insurer
+// that an AI reading the document's format alone couldn't detect, since
+// AI verification only confirms a document *looks* right, not that the
+// insurer named on it genuinely exists.
+//
+// Honest limitation: this is a partial reference set (a few hundred of
+// the several thousand entries in NAIC's full registry), so a real,
+// legitimate insurer simply not being in this list is a genuine
+// possibility — a "not found" result should be treated as "needs a second
+// look," not automatic proof of fraud. A code that IS found but doesn't
+// match the stated insurer name is a much stronger red flag.
+const NAIC_REGISTRY = {"11":"MAINE EMPLOYERS MUT INS CO","18":"RESPONSE INS GRP","19":"AETNA CAS GRP","26":"COMBINED STMT OF MS & AD GRP OF C","28":"NEW YORK CENTRAL MUT FIRE INS CO","29":"PROASSURANCE CORP GRP & AFFIL","31":"ASSOC INDUSTRIES OF MA MUT INS CO","32":"NCMIC INS CO & AFFIL","37":"BUILDERS INS & AFFIL","40":"ISMIE INS GRP","42":"EASTERN ALLIANCE INS & AFFIL","47":"FIRST ACCEPTANCE INS CO INC & AFF","50":"FOUNDERS INS CO MI & AFFIL","51":"ALFA INS GRP","52":"WISCONSIN CNTY MUT & AFFIL","53":"EMPLOYERS INS GRP","54":"ALLIED WORLD ASSUR CO US INC","56":"AXIS SPECIALTY INS CO & AFFIL","57":"PARTNER REINS CO OF THE US & AFFI","59":"TUSCARORA WAYNE MUT INS CO","64":"RED SHIELD INS CO","65":"JAMES RIVER INS GRP","66":"SOMPO GRP","67":"ATAIN SPECIALTY INS CO & ITS AFFI","70":"TRAVELERS COS & AFFIL","73":"ENUMCLAW INS GRP","74":"AMERICAN INDEPENDENT COMPANIES IN","78":"FEDERATED MUT GRP","80":"FARMERS & MECHANICS INS COS","84":"ACCIDENT FUND INS CO OF AMER & AF","85":"FIDELITY NATL INS CO & SUBSIDIARI","86":"ALLSTATE INS CO GRP","87":"GEOVERA HOLDINGS INC GRP","93":"CUMIS INS SOCIETY & AFFILIATE","96":"PRIME HOLDINGS INS GRP","124":"AMERICAN INTL GRP INC","154":"LOYA INS CO & AFFIL","176":"FIRST STATE GRP","191":"ASSURANT GRP","221":"MERRIMACK MUT GRP","260":"AMERICAN HALLMARK INS CO OF TX &","280":"AMICA MUT GRP","285":"COPPERPOINT MUT INS CO & ITS AFFI","294":"DTRIC INS CO LTD & AFFIL","297":"SKYWARD SPECIALTY INS GRP INC","301":"IMT INS CO & AFFILIATE","310":"NATIONAL IND CO GRP","317":"BUILDERS MUT INS CO & AFFIL","329":"BITUMINOUS CAS GRP","337":"CALIFORNIA CAS GRP","353":"CELINA MUT GRP","361":"CENTRAL MUT OF OH GRP","377":"PURE INS CO & AFFILIATE","379":"MENDOTA INS CO & AFFILIATES","380":"PACIFIC SPECIALTY INS CO & AFFILI","381":"HISCOX INS CO INC & AFFILIATE","384":"TECHNOLOGY INS CO INC & AFFIL","399":"HARCO NATIONAL INS CO & ITS AFFIL","412":"STARR INDEMNITY AND LIABILITY CO","433":"ARCH MORTGAGE INS CO AND ITS AFFI","440":"SAFETY FIRST INS CO & ITS AFFILIA","447":"CHURCH MUT INS CO & ITS AFFILIATE","460":"BUCKEYE INS GRP","468":"JEWELERS MUT INS CO & AFFIL","473":"MINNESOTA LAWYERS MUT INS CO & IT","482":"ASMI AUTO INS CO & AFFILIATES","507":"COUNTRY MUT OF IL GRP","524":"SPINNAKER INS CO & AFFILIATES","529":"TESLA INS CO & AFFILIATES","535":"LIO INS CO & AFFILIATES","540":"CUMBERLAND INS GRP","548":"WEST BEND INS CO & AFFILIATES","554":"LOUISIANA WORKERS COMPENSATION CO","558":"AUTO CLUB INS ASSN","573":"SUNZ INS CO & AFFILIATE","620":"EMPLOYERS MUT CO OF DES MOINES","623":"CRUM & FORSTER INS","626":"ACE AMER INS CO & AFFIL","634":"OHIO MUT GRP","637":"ROCKINGHAM GRP","655":"GLOBAL","667":"EVEREST REINS CO","671":"FARM BUREAU OF MI GRP","698":"FARMERS INS GRP","712":"PALISADES INS GRP","723":"SERVICE LLOYDS GRP","727":"ARCH CAPITAL GRP INC","734":"CSAA INS EXCH AND ITS AFFILIATED","738":"FRANKENMUTH MUT INS GRP","743":"GREENWHICH INS CO & AFFILIATES","745":"AUTO CLUB ENTERPRISES INS & AFFIL","795":"MOTORS INS CORP GRP","833":"GRANGE INS ASSN & AFFIL","841":"GREAT AMER INS CO & AFFILIATES","884":"HANOVER INS CO GRP","914":"HARTFORD FIRE GRP","981":"BERKLEY CORP","1058":"MORTGAGE GUAR INS CORP & AFFIL","1112":"LIBERTY MUT GRP","1236":"SHELTER MUT INS CO & AFFILIATES","1244":"AMERISURE MUT INS CO & AFFIL","1279":"AMERICAN MODERN INS GRP INC","1406":"NATIONWIDE GRP","1503":"OLD REPUBLIC INS GRP","1554":"PROGRESSIVE CAS GRP","1694":"SENTRY INS A MUT CO GRP","1767":"STATE FARM MUT GRP","1813":"SWISS RE AMER CORP GRP","2003":"UNITED SERV AUTOMOBILE ASSN & AFF","2127":"ZURICH INS CO GRP","2135":"ERIE INS EXCH GRP","2186":"CONTINENTAL CAS GRP","2429":"SELECTIVE INS GRP","2445":"CINCINNATI INS GRP","2488":"UNITED FIRE & CAS GRP","2801":"AUTO OWNERS INS CO & AFFIL","2917":"ENCOVA MUT INS COS","3000":"HORACE MANN GRP","4731":"AMERICAN FAMILY INS GRP","6602":"MERCURY CAS GRP","7838":"RLI INS CO GRP","8427":"FARM BUREAU GRP","9229":"INSURANCE CO OF THE WEST GRP","10014":"AFFILIATED FM INS CO","10030":"WESTCHESTER FIRE INS CO","10052":"CHUBB NATL INS CO","10064":"CITIZENS PROP INS CORP","10070":"NATIONWIDE IND CO","10105":"VICTORIA SELECT INS CO","10127":"ALLIED INS CO OF AMER","10176":"CITIZENS INS CO OF OH","10192":"PROGRESSIVE SELECT INS CO","10193":"PROGRESSIVE EXPRESS INS CO","10194":"ARTISAN & TRUCKERS CAS CO","10202":"OHIO MUT INS CO","10245":"AMERICAN FEDERATION INS CO","10254":"WEST & KNOX MUT INS CO","10255":"WASHINGTON MUT INS ASSOC","10261":"WASHINGTON CO FARMERS MUT INS ASS","10264":"NORTON MUT FIRE ASSN","10266":"PARIS & WASHINGTON INS CO","10267":"PATRONS BUCKEYE MUT INS CO","10268":"PIKE MUT INS CO","10269":"RICHMOND FARMERS MUT INS CO","10270":"SANDY & BEAVER VALLEY FARMERS MUT","10271":"SONNENBERG MUT INS ASSOC","10272":"SPRINGFIELD TWP MUT INS ASSOC","10275":"UNITED MUT INS CO OF HANCOCK CO","10279":"MENNONITE MUT AID SOCIETY","10281":"MARION MUT INS ASSN","10288":"INTEGRITY SELECT INS CO","10303":"FARMERS MUT AID ASSN","10304":"FARMERS MUT INS CO","10305":"FARMERS MUT INS CO OF HARRISON CT","10306":"WYANDOT MUT INS CO","10307":"GERMAN FARMERS MUT FIRE INS CO","10309":"GERMAN FARMERS MUT OF SARDIS INS","10311":"GERMAN MUT INS CO OF DELPHOS","10322":"GRANGE IND INS CO","10330":"LUCAS CNTY MUT INS ASS OC","10331":"EASTERN OH MUT FIRE & TORNADO","10334":"GERMAN MUT INS ASSOC OF GLANDORF","10345":"COMMUNITY INS COMPANY","10396":"PERRY CNTY MUT FIRE INS CO","10397":"PUTNAM CNTY FARMERS MUT INS ASSOC","10399":"WOODVILLE MUT INS ASSOC","10645":"DRIVERS INS CO","10674":"HARLEYSVILLE INS CO OF NY","10677":"THE CINCINNATI INS CO","10719":"UNITED MUT INS CO","10723":"NATIONWIDE ASSUR CO","10739":"STATE FARM FL INS CO","10948":"NATIONWIDE INS CO OF FL","10974":"ROOT INS CO","11017":"STATE AUTO INS CO OF OH","11034":"BRISTOL W CAS INS CO","11051":"NATIONAL INTERSTATE INS CO OF HI","11136":"GRANGE INS CO OF MI","11197":"NATIONAL INDEPENDENT TRUCKERS IC","11518":"PARAMOUNT INS CO","11738":"INFINITY AUTO INS CO","11770":"UNITED FINANCIAL CAS CO","11828":"STONEWOOD INS CO","11851":"PROGRESSIVE ADVANCED INS CO","11982":"GRANGE PROP & CAS INS CO","11991":"NATIONAL CAS CO","12203":"JAMES RIVER INS CO","12302":"PROGRESSIVE FREEDOM INS CO","12475":"REPUBLIC FRANKLIN INS CO","12750":"EVERGREEN NATL IND CO","12879":"PROGRESSIVE COMMERCIAL CAS CO","12938":"FEDERAL MOTOR CARRIERS RRG INC","12986":"INTEGRITY PROP & CAS INS CO","13072":"UNITED OHIO INS CO","13331":"MOTORISTS COMMERCIAL MUT INS CO","13685":"JAMES RIVER CAS CO","13794":"MID CONTINENT EXCESS AND SURPLUS","13938":"FARMERS LLOYDS INS CO TX","13998":"UTICA NATL INS CO OF OH","14060":"GRANGE INS CO","14127":"GRANGE INS CO","14303":"INTEGRITY INS CO","14621":"MOTORISTS MUT INS CO","15380":"MID CONTINENT ASSUR CO","15580":"SCOTTSDALE IND CO","15736":"VERTI INS CO","16011":"NATIONAL TRANSPORTATION INS CO RR","16025":"TRANSPORT RISK SOLUTIONS RRG INC"};
+
+app.get("/api/naic-lookup/:code", (req, res) => {
+  const code = String(req.params.code).replace(/\D/g, "");
+  const registryName = NAIC_REGISTRY[code];
+  res.json({
+    code,
+    found: !!registryName,
+    registryName: registryName || null,
+  });
+});
+
 app.post("/api/ai-verify-document", async (req, res) => {
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
