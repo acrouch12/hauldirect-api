@@ -354,6 +354,24 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
     const existing = await db.getUserByEmail(email);
     if (existing) return res.status(409).json({ error: "An account with that email already exists." });
 
+    // Prevents the same real carrier from signing up a second time under a
+    // different email but the same MC/DOT number — email-uniqueness alone
+    // doesn't catch this, since MC/DOT numbers are the actual persistent
+    // identifier, not the email address someone happens to sign up with.
+    if (mcNumber || dotNumber) {
+      const cleanMc = mcNumber ? String(mcNumber).replace(/\D/g, "") : null;
+      const cleanDot = dotNumber ? String(dotNumber).replace(/\D/g, "") : null;
+      const { data: existingByAuthority } = await supabase.from("users").select("id, email, mc_number, dot_number")
+        .or([cleanMc ? `mc_number.eq.${cleanMc}` : null, cleanDot ? `dot_number.eq.${cleanDot}` : null].filter(Boolean).join(","));
+      const authorityMatch = (existingByAuthority || []).find((u) =>
+        (cleanMc && u.mc_number && String(u.mc_number).replace(/\D/g, "") === cleanMc) ||
+        (cleanDot && u.dot_number && String(u.dot_number).replace(/\D/g, "") === cleanDot)
+      );
+      if (authorityMatch) {
+        return res.status(409).json({ error: "An account already exists for this MC/DOT number. Each carrier authority may only have one active account — contact us directly if you believe this is an error." });
+      }
+    }
+
     const user = await db.createUser({
       id:               crypto.randomUUID(),
       name,
