@@ -39,7 +39,7 @@ if (emailjsNode) {
 }
 const EMAILJS_SERVICE_ID = process.env.EMAILJS_SERVICE_ID || "service_1h4mak5";
 const EMAILJS_VERIFY_TEMPLATE = process.env.EMAILJS_VERIFY_TEMPLATE || "template_4m5qw9o";
-const EMAILJS_BAN_EVASION_TEMPLATE = process.env.EMAILJS_BAN_EVASION_TEMPLATE || "YOUR_BAN_EVASION_TEMPLATE"; // create this template in EmailJS
+const EMAILJS_BAN_EVASION_TEMPLATE = process.env.EMAILJS_BAN_EVASION_TEMPLATE || "template_8uzb2r5";
 const loginCodes = {}; // { [email]: { code, expiresAt } } — simple in-memory store, fine at this scale
 
 // Operator-controlled testing toggle — lets ANY code (or none at all) work
