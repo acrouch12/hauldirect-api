@@ -576,7 +576,10 @@ const LOAD_FIELD_MAP = {
   quickPay: "quick_pay", paidAt: "paid_at",
   postedAt: "posted_at", updatedAt: "updated_at",
   cancelledAt: "cancelled_at", cancelledBy: "cancelled_by", cancelReason: "cancel_reason",
-  cancelHistory: "cancel_history", trailerLength: "trailer_length",
+  cancelHistory: "cancel_history", trailerLength: "trailer_length", cancellationFee: "cancellation_fee",
+  rateIncreaseStatus: "rate_increase_status", rateIncreaseAmount: "rate_increase_amount",
+  rateIncreaseReason: "rate_increase_reason", rateIncreaseOfferedAt: "rate_increase_offered_at",
+  rateIncreaseResolvedAt: "rate_increase_resolved_at",
   returnTripStatus: "return_trip_status", returnTripReason: "return_trip_reason",
   returnTripFee: "return_trip_fee", returnTripNote: "return_trip_note",
   returnTripRequestedAt: "return_trip_requested_at", returnTripResolvedAt: "return_trip_resolved_at",
@@ -606,7 +609,8 @@ const LOAD_VALID_COLUMNS = new Set([
   "commodity", "qty", "freight_condition", "pallets", "linear_feet", "oversize",
   "permit_required", "temp_requirement", "temp_spec", "stackable", "do_not_stack",
   "fragile", "unload_type", "appointment_required", "twic_required", "hazmat_class",
-  "special", "cancelled_at", "cancelled_by", "cancel_reason", "cancel_history", "documents", "trailer_length",
+  "special", "cancelled_at", "cancelled_by", "cancel_reason", "cancel_history", "documents", "trailer_length", "cancellation_fee",
+  "rate_increase_status", "rate_increase_amount", "rate_increase_reason", "rate_increase_offered_at", "rate_increase_resolved_at",
   "return_trip_status", "return_trip_reason", "return_trip_fee", "return_trip_note",
   "return_trip_requested_at", "return_trip_resolved_at", "additional_pay_fee",
   "bol_package_count", "bol_package_type", "bol_sent_at",
@@ -1118,6 +1122,9 @@ app.delete("/api/auth/account", requireUserAuth, async (req, res) => {
 const FREE_WINDOW_MS     = 2 * 60 * 60 * 1000;
 const DETENTION_RATE_HR  = 60;
 const INCREMENT_MIN      = 15;
+const DETENTION_CAP      = 300; // absolute max, regardless of how long a carrier sits — without
+                                 // this, a carrier stuck at a facility for days would generate an
+                                 // ever-growing, uncapped charge to a real shipper's real card
 // 5 miles, not 1 — facility coordinates are derived from the origin ZIP
 // code's centroid (real geocoding, not exact street address), and ZIP codes
 // can span several miles, especially in less dense areas. A tight 1-mile
@@ -1139,7 +1146,7 @@ function calcDetention(arrivalAt, departureAt) {
   const dwellMs  = (departureAt || Date.now()) - arrivalAt;
   const overMs   = Math.max(0, dwellMs - FREE_WINDOW_MS);
   const billMin  = Math.ceil((overMs / 60000) / INCREMENT_MIN) * INCREMENT_MIN;
-  const amount   = parseFloat(((billMin / 60) * DETENTION_RATE_HR).toFixed(2));
+  const amount   = Math.min(DETENTION_CAP, parseFloat(((billMin / 60) * DETENTION_RATE_HR).toFixed(2)));
   return { dwellMs, billMin, amount };
 }
 
@@ -1582,6 +1589,13 @@ app.get("/api/insurance-monitor/:dotNumber", async (req, res) => {
 // First 100 signups get a 30% off promo code automatically
 // ================================================================
 const WAITLIST_PROMO_LIMIT = 100;
+// Real, server-side launch cutoff — set to the actual go-live moment. The
+// frontend also gates this, but a discount is a real financial promise, so
+// it can't rely on client-side gating alone: anyone calling this endpoint
+// directly, bypassing the UI entirely, must still be correctly refused the
+// early-bird discount once launched, regardless of how many of the 100
+// spots happened to be claimed before that moment.
+const WAITLIST_PROMO_CUTOFF = new Date("2026-08-05T00:00:00Z"); // update if launch day changes
 const WAITLIST_DISCOUNT    = 20; // 20% off for 3 months
 
 // Generates a random, non-sequential promo code so codes can't be guessed
@@ -1610,7 +1624,7 @@ app.post("/api/waitlist", async (req, res) => {
     // Get current count for position
     const { count } = await supabase.from("waitlist").select("*", { count: "exact", head: true });
     const position = (count || 0) + 1;
-    const isEarlyBird = position <= WAITLIST_PROMO_LIMIT;
+    const isEarlyBird = position <= WAITLIST_PROMO_LIMIT && Date.now() < WAITLIST_PROMO_CUTOFF.getTime();
     const promoCode = isEarlyBird ? generatePromoCode(position) : null;
 
     const { data, error } = await supabase.from("waitlist").insert({
