@@ -542,11 +542,27 @@ function mapUserFields(body) {
 
 app.patch("/api/auth/user/:id", async (req, res) => {
   try {
-    // Real, server-side enforcement — not just a frontend nicety. A
-    // shipper could otherwise call this endpoint directly, bypassing the
-    // UI entirely, to remove their card while a carrier is owed payment
-    // for a load already accepted or hauled. This closes that exploit at
-    // the source, regardless of how the request was made.
+    // This endpoint had no authentication at all — meaning anyone, logged
+    // in or not, could PATCH any user's row directly by ID: change their
+    // email (and then request a login code to hijack the account), mark
+    // themselves as verified without real verification, remove their own
+    // suspension/ban, or edit another shipper's billing. Now requires
+    // either a valid operator PIN (operators legitimately edit any user's
+    // profile from the dashboard) or a valid session that actually
+    // belongs to the profile being edited.
+    const operatorPin = req.headers["x-operator-pin"];
+    const isOperator = !!process.env.OPERATOR_PIN && operatorPin === process.env.OPERATOR_PIN;
+    if (!isOperator) {
+      const token = req.headers["x-session-token"];
+      const session = token && sessionTokens[token];
+      if (!session || Date.now() > session.expiresAt) {
+        return res.status(401).json({ error: "Not logged in, or your session has expired. Please log in again." });
+      }
+      if (session.userId !== req.params.id) {
+        return res.status(403).json({ error: "You don't have permission to update this profile." });
+      }
+    }
+
     const isRemovingBilling = req.body.billing && req.body.billing.connected === false;
     if (isRemovingBilling) {
       const { data: unpaidLoads } = await supabase.from("loads")
@@ -755,10 +771,22 @@ app.get("/api/loads/:id/bids", async (req, res) => {
 });
 
 // PATCH /api/bids/:id
-app.patch("/api/bids/:id", async (req, res) => {
+app.patch("/api/bids/:id", requireUserAuth, async (req, res) => {
   try {
-    const bid = await db.updateBid(req.params.id, req.body);
-    res.json({ bid });
+    // No authentication or ownership check existed here — meaning anyone
+    // logged in could accept, reject, or counter any bid on any load, not
+    // just their own. Now verifies the requester is either the shipper who
+    // owns the load this bid is on, or the carrier who placed the bid.
+    const { data: bid } = await supabase.from("bids").select("id, load_id, carrier_id").eq("id", req.params.id).single();
+    if (!bid) return res.status(404).json({ error: "Bid not found." });
+    const load = await db.getLoadById(bid.load_id);
+    const isOwningShipper = load && load.shipper_id === req.userId;
+    const isBiddingCarrier = bid.carrier_id === req.userId;
+    if (!isOwningShipper && !isBiddingCarrier) {
+      return res.status(403).json({ error: "You don't have permission to update this bid." });
+    }
+    const bidResult = await db.updateBid(req.params.id, req.body);
+    res.json({ bid: bidResult });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1884,13 +1912,37 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
 // Matches your "sellers collect funds directly" Connect setup — money goes
 // straight to the carrier, this platform never holds it.
 // ================================================================
-app.post("/api/stripe/pay-load", async (req, res) => {
+app.post("/api/stripe/pay-load", requireUserAuth, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
-  const { shipperCustomerId, carrierStripeAccountId, amountCents, loadId, quickPay, returnTrip } = req.body;
-  if (!shipperCustomerId || !carrierStripeAccountId || !amountCents || !loadId) {
-    return res.status(400).json({ error: "shipperCustomerId, carrierStripeAccountId, amountCents, and loadId are required" });
+  const { amountCents, loadId, quickPay, returnTrip } = req.body;
+  if (!amountCents || !loadId) {
+    return res.status(400).json({ error: "amountCents and loadId are required" });
   }
   try {
+    // This previously had no authentication at all, and worse, trusted
+    // shipperCustomerId and carrierStripeAccountId directly from the
+    // request body — meaning anyone could call this endpoint and redirect
+    // a real charge to any Stripe account they chose, not just the actual
+    // carrier on the actual load. Now the load is looked up server-side,
+    // the requester is verified as the real owning shipper, and both
+    // Stripe IDs are pulled from the real database records — never from
+    // anything the client sent.
+    const load = await db.getLoadById(loadId);
+    if (!load) return res.status(404).json({ error: "Load not found." });
+    if (load.shipper_id !== req.userId) {
+      return res.status(403).json({ error: "You don't have permission to release payment on this load." });
+    }
+    if (!load.carrier_id) {
+      return res.status(400).json({ error: "This load has no carrier assigned yet." });
+    }
+
+    const shipper = await db.getUserById(req.userId);
+    const carrier = await db.getUserById(load.carrier_id);
+    const shipperCustomerId = shipper?.billing?.stripeCustomerId;
+    const carrierStripeAccountId = carrier?.payout?.stripeAccountId;
+    if (!shipperCustomerId) return res.status(400).json({ error: "No payment method on file for this shipper." });
+    if (!carrierStripeAccountId) return res.status(400).json({ error: "This carrier hasn't connected a payout account yet." });
+
     // A PaymentIntent isn't charged just by creating it — it has to be
     // confirmed with an actual payment method. Since the shipper isn't
     // actively present at checkout when a load is released (this happens
