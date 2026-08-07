@@ -1840,7 +1840,15 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
         },
         quantity: 1,
       }],
-      subscription_data: { metadata: { userId, planId, billingCycle: billingCycle || "monthly" } },
+      subscription_data: {
+        metadata: { userId, planId, billingCycle: billingCycle || "monthly" },
+        // Real, Stripe-enforced trial — until now, the frontend displayed
+        // "30 days free" purely as an estimate, but nothing here actually
+        // told Stripe not to charge immediately, meaning every real
+        // signup was genuinely being charged right away despite the
+        // app's own messaging promising a free trial period.
+        trial_period_days: 30,
+      },
       // Managed Payments is Stripe's international merchant-of-record feature
       // (indirect tax compliance across 80+ countries) — not relevant to a
       // US-only domestic subscription business, and it requires product tax
