@@ -662,16 +662,20 @@ function mapLoadFields(body) {
 }
 
 // POST /api/loads
-app.post("/api/loads", async (req, res) => {
+app.post("/api/loads", requireUserAuth, async (req, res) => {
   try {
     // Server-controlled fields go AFTER the spread so they always win,
     // regardless of what the frontend sends — previously this was reversed,
     // meaning a raw Date.now() number from the frontend (e.g. 1784680773527)
     // would silently overwrite the correct ISO date string here, causing
     // "date/time field value out of range" and the whole insert to fail.
+    // shipper_id is now also forced to the authenticated user, not
+    // whatever the request claimed — without this, anyone logged in could
+    // post a load under a different shipper's identity entirely.
     const load = await db.createLoad({
       ...mapLoadFields(req.body),
       id:           crypto.randomUUID(),
+      shipper_id:   req.userId,
       status:       "open",
       carrier_id:   null,
       progress:     0,
@@ -743,12 +747,15 @@ app.delete("/api/loads/:id", requireOperatorAuth, async (req, res) => {
 // ================================================================
 
 // POST /api/loads/:id/bids
-app.post("/api/loads/:id/bids", async (req, res) => {
+app.post("/api/loads/:id/bids", requireUserAuth, async (req, res) => {
   try {
+    // carrier_id now forced to the authenticated user, not whatever the
+    // request claimed — without this, anyone logged in could submit a bid
+    // under a different carrier's identity.
     const bid = await db.createBid({
       id:         crypto.randomUUID(),
       load_id:    req.params.id,
-      carrier_id: req.body.carrierId,
+      carrier_id: req.userId,
       amount:     req.body.amount,
       note:       req.body.note || null,
       status:     "pending",
@@ -840,15 +847,21 @@ app.delete("/api/feedback/:id", requireOperatorAuth, async (req, res) => {
 // ================================================================
 
 // POST /api/messages
-app.post("/api/messages", async (req, res) => {
+app.post("/api/messages", requireUserAuth, async (req, res) => {
   try {
+    // senderId, role, and name were all trusted directly from the request
+    // — meaning anyone logged in could send a message impersonating a
+    // different user entirely (e.g. pretending to be the shipper, telling
+    // a carrier "payment's already sent, go ahead and deliver"). Now
+    // derived from the authenticated user's own real profile.
+    const sender = await db.getUserById(req.userId);
     const msg = await db.sendMessage({
       id:         crypto.randomUUID(),
       load_id:    req.body.loadId,
       carrier_id: req.body.carrierId,
-      sender_id:  req.body.senderId,
-      role:       req.body.role,
-      name:       req.body.name,
+      sender_id:  req.userId,
+      role:       req.body.role, // shipper/carrier framing of the conversation, not identity
+      name:       sender?.name || sender?.company || "Unknown",
       text:       req.body.text,
       sent_at:    new Date().toISOString(),
     });
@@ -859,8 +872,19 @@ app.post("/api/messages", async (req, res) => {
 });
 
 // GET /api/messages/:loadId/:carrierId
-app.get("/api/messages/:loadId/:carrierId", async (req, res) => {
+app.get("/api/messages/:loadId/:carrierId", requireUserAuth, async (req, res) => {
   try {
+    // No access control existed here at all — anyone could read any
+    // conversation between any shipper and carrier just by knowing the
+    // loadId and carrierId, a real privacy exposure for potentially
+    // sensitive business communications. Now verifies the requester is
+    // genuinely part of this specific conversation.
+    const load = await db.getLoadById(req.params.loadId);
+    const isOwningShipper = load && load.shipper_id === req.userId;
+    const isTheCarrier = req.params.carrierId === req.userId;
+    if (!isOwningShipper && !isTheCarrier) {
+      return res.status(403).json({ error: "You don't have permission to view this conversation." });
+    }
     const messages = await db.getMessages(req.params.loadId, req.params.carrierId);
     res.json({ messages });
   } catch (err) {
@@ -874,8 +898,14 @@ app.get("/api/messages/:loadId/:carrierId", async (req, res) => {
 // no way to discover a message ever arrived unless it happened to be tied
 // to a load they already knew to open — a real gap for anything sent
 // outside a specific load's own chat.
-app.get("/api/messages/inbox/:carrierId", async (req, res) => {
+app.get("/api/messages/inbox/:carrierId", requireUserAuth, async (req, res) => {
   try {
+    // Same gap as the conversation endpoint above — a carrier's entire
+    // inbox, every thread across every shipper, was readable by anyone
+    // who knew their ID. Only the carrier themselves should see this.
+    if (req.params.carrierId !== req.userId) {
+      return res.status(403).json({ error: "You don't have permission to view this inbox." });
+    }
     const { data, error } = await supabase
       .from("messages")
       .select("*")
@@ -909,12 +939,12 @@ app.get("/api/messages/inbox/:carrierId", async (req, res) => {
 // ================================================================
 
 // POST /api/documents
-app.post("/api/documents", async (req, res) => {
+app.post("/api/documents", requireUserAuth, async (req, res) => {
   try {
     const doc = await db.saveDocument({
       id:              crypto.randomUUID(),
       load_id:         req.body.loadId,
-      uploaded_by:     req.body.uploadedBy,
+      uploaded_by:     req.userId,
       uploaded_by_name: req.body.uploadedByName,
       type:            req.body.type,
       filename:        req.body.filename,
@@ -930,7 +960,7 @@ app.post("/api/documents", async (req, res) => {
 });
 
 // GET /api/documents/:loadId
-app.get("/api/documents/:loadId", async (req, res) => {
+app.get("/api/documents/:loadId", requireUserAuth, async (req, res) => {
   try {
     const documents = await db.getDocumentsForLoad(req.params.loadId);
     res.json({ documents });
@@ -944,13 +974,25 @@ app.get("/api/documents/:loadId", async (req, res) => {
 // ================================================================
 
 // POST /api/ratings
-app.post("/api/ratings", async (req, res) => {
+app.post("/api/ratings", requireUserAuth, async (req, res) => {
   try {
+    // raterUserId was trusted directly from the request — anyone could
+    // submit a rating claiming to be from a different user entirely,
+    // artificially inflating or deflating someone's real rating. Now
+    // derived from the authenticated session, and verified against the
+    // load actually being rated.
+    const load = await db.getLoadById(req.body.loadId);
+    const isOwningShipper = load && load.shipper_id === req.userId;
+    const isAssignedCarrier = load && load.carrier_id === req.userId;
+    if (!isOwningShipper && !isAssignedCarrier) {
+      return res.status(403).json({ error: "You don't have permission to rate on this load." });
+    }
+
     const rating = await db.saveRating({
       id:             crypto.randomUUID(),
       load_id:        req.body.loadId,
       rated_user_id:  req.body.ratedUserId,
-      rater_user_id:  req.body.raterUserId,
+      rater_user_id:  req.userId,
       stars:          req.body.stars,
       role:           req.body.role,
       created_at:     new Date().toISOString(),
@@ -1072,6 +1114,11 @@ app.get("/api/operator/subscription-revenue", requireOperatorAuth, async (req, r
 // documents, operator notes) with no protection at all, before today's
 // security pass. Now regular browsing uses this safe version, and the real
 // operator dashboard uses the separately protected endpoint below.
+// Deliberately public, no login required — called at app startup before
+// login completes, to load the basic directory data the app needs
+// regardless of auth status. Kept intentionally limited to the safe,
+// curated field list below (no email, phone, Stripe IDs, or documents)
+// specifically because it has to stay reachable pre-login.
 app.get("/api/users/directory", async (req, res) => {
   try {
     const users = await db.getAllUsers();
@@ -1421,10 +1468,17 @@ app.post("/api/operator/testing/simulate-detention", requireOperatorAuth, (req, 
   });
 });
 
-app.post("/api/tracking/ping", async (req, res) => {
+app.post("/api/tracking/ping", requireUserAuth, async (req, res) => {
   const { loadId, carrierId, lat, lng, facilityLat, facilityLng } = req.body;
   if (!loadId || lat == null || lng == null || facilityLat == null || facilityLng == null)
     return res.status(400).json({ error: "loadId, lat, lng, facilityLat, facilityLng required" });
+  // Detention pay is real money — without verifying who's actually
+  // sending this ping, anyone could spoof a fake "arrival" at a facility
+  // and trigger real detention charges without genuinely being there.
+  const load = await db.getLoadById(loadId);
+  if (!load || load.carrier_id !== req.userId) {
+    return res.status(403).json({ error: "You don't have permission to send tracking updates for this load." });
+  }
   const now = Date.now();
 
   // Always record the carrier's latest real GPS position for the shipper's live map,
@@ -1545,14 +1599,25 @@ app.get("/api/tracking/position/:loadId", async (req, res) => {
 // ================================================================
 
 // POST /api/disputes
-app.post("/api/disputes", async (req, res) => {
+app.post("/api/disputes", requireUserAuth, async (req, res) => {
   try {
+    // filedBy was trusted directly from the request — anyone logged in
+    // could file a dispute claiming to be a different user entirely,
+    // including false accusations against a real person. Now derived from
+    // the authenticated session, and verified against the actual load.
+    const load = await db.getLoadById(req.body.loadId);
+    const isOwningShipper = load && load.shipper_id === req.userId;
+    const isAssignedCarrier = load && load.carrier_id === req.userId;
+    if (!isOwningShipper && !isAssignedCarrier) {
+      return res.status(403).json({ error: "You don't have permission to file a dispute on this load." });
+    }
+    const filer = await db.getUserById(req.userId);
     const { data, error } = await supabase.from("disputes").insert({
       id:             crypto.randomUUID(),
       load_id:        req.body.loadId,
-      filed_by:       req.body.filedBy,
-      filed_by_name:  req.body.filedByName,
-      filed_by_role:  req.body.filedByRole,
+      filed_by:       req.userId,
+      filed_by_name:  filer?.name || filer?.company || "Unknown",
+      filed_by_role:  isOwningShipper ? "shipper" : "carrier",
       against_id:     req.body.againstId,
       against_name:   req.body.againstName,
       type:           req.body.type,
@@ -1986,6 +2051,13 @@ app.post("/api/stripe/create-billing-portal-session", requireUserAuth, async (re
   if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
   const { customerId, returnOrigin } = req.body;
   if (!customerId) return res.status(400).json({ error: "customerId is required" });
+  // Being logged in isn't enough on its own — without this check, any
+  // logged-in user could open any other user's billing portal, just by
+  // knowing or guessing their Stripe customer ID.
+  const requester = await db.getUserById(req.userId);
+  if (requester?.billing?.stripeCustomerId !== customerId) {
+    return res.status(403).json({ error: "You don't have permission to access this billing portal." });
+  }
   try {
     const origin = safeFrontendOrigin(returnOrigin);
     const session = await stripe.billingPortal.sessions.create({
@@ -2006,11 +2078,22 @@ app.post("/api/stripe/create-billing-portal-session", requireUserAuth, async (re
 // pay out to their bank FASTER (minutes instead of Stripe's ~2 business
 // day standard schedule), for the 1.5% fee already shown in the app.
 // ================================================================
-app.post("/api/stripe/instant-payout", async (req, res) => {
+app.post("/api/stripe/instant-payout", requireUserAuth, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
   const { carrierStripeAccountId, amountCents } = req.body;
   if (!carrierStripeAccountId || !amountCents) {
     return res.status(400).json({ error: "carrierStripeAccountId and amountCents are required" });
+  }
+  // Confirms the authenticated user actually owns this connected account —
+  // without this, anyone could trigger an instant payout (and its 1.5% fee)
+  // on a carrier's account without their consent, just by knowing their
+  // Stripe account ID. This always pays out to that same account's own
+  // linked bank, so it can't redirect money elsewhere, but taking an
+  // unauthorized action — and cost — on someone else's account is still a
+  // real problem worth closing.
+  const requester = await db.getUserById(req.userId);
+  if (requester?.payout?.stripeAccountId !== carrierStripeAccountId) {
+    return res.status(403).json({ error: "You don't have permission to request a payout on this account." });
   }
   try {
     const payout = await stripe.payouts.create(
