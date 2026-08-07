@@ -542,6 +542,20 @@ function mapUserFields(body) {
 
 app.patch("/api/auth/user/:id", async (req, res) => {
   try {
+    // Real, server-side enforcement — not just a frontend nicety. A
+    // shipper could otherwise call this endpoint directly, bypassing the
+    // UI entirely, to remove their card while a carrier is owed payment
+    // for a load already accepted or hauled. This closes that exploit at
+    // the source, regardless of how the request was made.
+    const isRemovingBilling = req.body.billing && req.body.billing.connected === false;
+    if (isRemovingBilling) {
+      const { data: unpaidLoads } = await supabase.from("loads")
+        .select("id").eq("shipper_id", req.params.id).not("carrier_id", "is", null)
+        .eq("paid", false).neq("status", "cancelled");
+      if (unpaidLoads && unpaidLoads.length > 0) {
+        return res.status(403).json({ error: `Cannot remove payment method — ${unpaidLoads.length} unpaid load(s) with a carrier assigned. Release payment first.` });
+      }
+    }
     const user = await db.updateUser(req.params.id, mapUserFields(req.body));
     res.json({ user });
   } catch (err) {
@@ -1986,6 +2000,8 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
           // account showed "Card ending in ····" regardless of what card
           // was actually used.
           let cardDetails = {};
+          let cardVerified = false;
+          let paymentMethodId = null;
           try {
             const customer = await stripe.customers.retrieve(session.customer, {
               expand: ["invoice_settings.default_payment_method"],
@@ -2001,14 +2017,39 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
                 last4: paymentMethod.card.last4,
                 exp: `${String(paymentMethod.card.exp_month).padStart(2, "0")}/${String(paymentMethod.card.exp_year).slice(-2)}`,
               };
+              paymentMethodId = paymentMethod.id;
             }
           } catch (cardErr) {
             console.warn("Could not fetch real card details after checkout:", cardErr.message);
           }
 
+          // Real card verification — a $1 charge, immediately refunded.
+          // Confirms the card can genuinely be charged right now (correct
+          // CVV, sufficient standing, not frozen/cancelled), which a card
+          // simply being accepted at signup doesn't fully guarantee — some
+          // cards pass basic format checks but still fail on a real charge
+          // attempt. Refunding immediately means the person is never
+          // actually out the dollar; this is purely a verification step.
+          if (paymentMethodId) {
+            try {
+              const verifyIntent = await stripe.paymentIntents.create({
+                amount: 100, currency: "usd", customer: session.customer,
+                payment_method: paymentMethodId, off_session: true, confirm: true,
+                description: "Card verification — automatically refunded",
+              });
+              if (verifyIntent.status === "succeeded") {
+                await stripe.refunds.create({ payment_intent: verifyIntent.id });
+                cardVerified = true;
+              }
+            } catch (verifyErr) {
+              console.warn(`Card verification charge failed for user ${userId} — card may not be genuinely chargeable:`, verifyErr.message);
+              cardVerified = false;
+            }
+          }
+
           await supabase.from("users").update({
             stripe_connected: true,
-            billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription, ...cardDetails },
+            billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription, cardVerified, ...cardDetails },
             trial_started_at: new Date().toISOString(),
           }).eq("id", userId);
         }
