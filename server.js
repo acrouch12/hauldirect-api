@@ -722,7 +722,13 @@ app.patch("/api/loads/:id", requireUserAuth, async (req, res) => {
     const isAssignedCarrier = existing.carrier_id === req.userId;
     // A carrier claiming a currently-open load (no carrier assigned yet) is
     // legitimate — but only if they're assigning themselves, not someone else.
-    const isClaimingOpenLoad = !existing.carrier_id && req.body.carrierId === req.userId;
+    // This was checking req.body.carrierId, but the frontend has only ever
+    // sent this field as truckerId — meaning this check could never be true,
+    // and every single carrier claim, pickup, and delivery confirmation has
+    // been silently rejected since this check was added, with no visible
+    // error to the person testing it (just a console warning).
+    const claimedId = req.body.truckerId ?? req.body.carrierId;
+    const isClaimingOpenLoad = !existing.carrier_id && claimedId === req.userId;
 
     if (!isOwningShipper && !isAssignedCarrier && !isClaimingOpenLoad) {
       return res.status(403).json({ error: "You don't have permission to update this load." });
