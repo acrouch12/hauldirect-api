@@ -1186,6 +1186,30 @@ app.patch("/api/operator/users/:id/terminate-permanently", requireOperatorAuth, 
 // DELETE /api/operator/users/:id
 app.delete("/api/operator/users/:id", requireOperatorAuth, async (req, res) => {
   try {
+    // Removing someone here previously only deleted their row in our own
+    // database — their Stripe subscription kept running and billing them,
+    // and their connected account (for carriers) stayed open, both fully
+    // untouched. Manually closing those by hand in the Stripe dashboard
+    // isn't reliably possible for a connected account (it requires actual
+    // API access, not dashboard-level permissions), so this now handles
+    // both automatically, using the platform's own API key.
+    const { data: user } = await supabase.from("users").select("billing, payout").eq("id", req.params.id).single();
+
+    if (stripe && user?.billing?.stripeSubscriptionId) {
+      try {
+        await stripe.subscriptions.cancel(user.billing.stripeSubscriptionId);
+      } catch (subErr) {
+        console.warn(`Could not cancel Stripe subscription for user ${req.params.id}:`, subErr.message);
+      }
+    }
+    if (stripe && user?.payout?.stripeAccountId) {
+      try {
+        await stripe.accounts.del(user.payout.stripeAccountId);
+      } catch (acctErr) {
+        console.warn(`Could not close Stripe connected account for user ${req.params.id}:`, acctErr.message);
+      }
+    }
+
     const { error } = await supabase.from("users").delete().eq("id", req.params.id);
     if (error) throw error;
     res.json({ deleted: true });
@@ -1200,6 +1224,26 @@ app.delete("/api/operator/users/:id", requireOperatorAuth, async (req, res) => {
 // if a different ID were somehow passed in.
 app.delete("/api/auth/account", requireUserAuth, async (req, res) => {
   try {
+    // Same real gap as the operator's removal endpoint — deleting an
+    // account here left the Stripe subscription still billing and any
+    // connected account still open, both fully untouched.
+    const { data: user } = await supabase.from("users").select("billing, payout").eq("id", req.userId).single();
+
+    if (stripe && user?.billing?.stripeSubscriptionId) {
+      try {
+        await stripe.subscriptions.cancel(user.billing.stripeSubscriptionId);
+      } catch (subErr) {
+        console.warn(`Could not cancel Stripe subscription for user ${req.userId}:`, subErr.message);
+      }
+    }
+    if (stripe && user?.payout?.stripeAccountId) {
+      try {
+        await stripe.accounts.del(user.payout.stripeAccountId);
+      } catch (acctErr) {
+        console.warn(`Could not close Stripe connected account for user ${req.userId}:`, acctErr.message);
+      }
+    }
+
     const { error } = await supabase.from("users").delete().eq("id", req.userId);
     if (error) throw error;
     res.json({ deleted: true });
@@ -2145,8 +2189,6 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
           // account showed "Card ending in ····" regardless of what card
           // was actually used.
           let cardDetails = {};
-          let cardVerified = false;
-          let paymentMethodId = null;
           try {
             const customer = await stripe.customers.retrieve(session.customer, {
               expand: ["invoice_settings.default_payment_method"],
@@ -2162,39 +2204,20 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
                 last4: paymentMethod.card.last4,
                 exp: `${String(paymentMethod.card.exp_month).padStart(2, "0")}/${String(paymentMethod.card.exp_year).slice(-2)}`,
               };
-              paymentMethodId = paymentMethod.id;
             }
           } catch (cardErr) {
             console.warn("Could not fetch real card details after checkout:", cardErr.message);
           }
 
-          // Real card verification — a $1 charge, immediately refunded.
-          // Confirms the card can genuinely be charged right now (correct
-          // CVV, sufficient standing, not frozen/cancelled), which a card
-          // simply being accepted at signup doesn't fully guarantee — some
-          // cards pass basic format checks but still fail on a real charge
-          // attempt. Refunding immediately means the person is never
-          // actually out the dollar; this is purely a verification step.
-          if (paymentMethodId) {
-            try {
-              const verifyIntent = await stripe.paymentIntents.create({
-                amount: 100, currency: "usd", customer: session.customer,
-                payment_method: paymentMethodId, off_session: true, confirm: true,
-                description: "Card verification — automatically refunded",
-              });
-              if (verifyIntent.status === "succeeded") {
-                await stripe.refunds.create({ payment_intent: verifyIntent.id });
-                cardVerified = true;
-              }
-            } catch (verifyErr) {
-              console.warn(`Card verification charge failed for user ${userId} — card may not be genuinely chargeable:`, verifyErr.message);
-              cardVerified = false;
-            }
-          }
-
+          // Removed the $1 verify-then-refund charge that used to run here —
+          // Stripe refunds the charge itself but keeps its own processing
+          // fee (roughly 2.9% + $0.30), meaning every single new signup was
+          // quietly costing the platform real money (about $0.33 each),
+          // permanently, not just during testing. Not worth the ongoing
+          // cost for the fraud protection it added.
           await supabase.from("users").update({
             stripe_connected: true,
-            billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription, cardVerified, ...cardDetails },
+            billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription, ...cardDetails },
             trial_started_at: new Date().toISOString(),
           }).eq("id", userId);
         }
