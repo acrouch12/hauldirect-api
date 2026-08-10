@@ -2052,7 +2052,7 @@ app.post("/api/stripe/pay-load", requireUserAuth, async (req, res) => {
       return res.status(403).json({ error: "You don't have permission to release payment on this load." });
     }
     if (!load.carrier_id) {
-      return res.status(400).json({ error: "This load has no carrier assigned yet." });
+      return res.status(400).json({ error: "This load shows no carrier assigned in the database, even if one appears assigned in the app. An operator can fix this directly from the operator dashboard's Loads tab using 'Edit / Fix'." });
     }
 
     const shipper = await db.getUserById(req.userId);
