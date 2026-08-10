@@ -1871,7 +1871,14 @@ app.get("/api/stripe/connect/authorize", async (req, res) => {
       const account = await stripe.accounts.create({
         type: "express",
         email: email || undefined,
-        capabilities: { transfers: { requested: true } },
+        // Requesting transfers alone (a "recipient-only" account) requires
+        // special approval from Stripe before it works — the exact error
+        // seen in testing. Carriers here never actually process card
+        // payments directly (the shipper's card is charged by the
+        // platform, then transferred to the carrier), but requesting
+        // card_payments alongside transfers avoids that approval
+        // requirement entirely, without changing how payments actually work.
+        capabilities: { transfers: { requested: true }, card_payments: { requested: true } },
       });
       accountId = account.id;
       await supabase.from("users").update({
