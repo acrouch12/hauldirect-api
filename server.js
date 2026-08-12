@@ -347,7 +347,7 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
     const { name, email, role, company, equipmentType, truckDesc, maxWeight,
             dotNumber, mcNumber, verification, coiVerified, coiData,
             bizVerified, bizData, stripeConnected, payout, billing,
-            loc, dims, lanes, eld, equipmentStatus, currentZip } = req.body;
+            loc, dims, lanes, eld, equipmentStatus, currentZip, phone, referralCode } = req.body;
 
     if (!name || !email || !role) return res.status(400).json({ error: "name, email, role required" });
 
@@ -372,11 +372,25 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
       }
     }
 
+    // Validate the referral code up front, if one was entered — better to
+    // tell the person right away than to silently drop a bad code and have
+    // their referrer never actually get credit for it.
+    let referredBy = null;
+    if (referralCode && referralCode.trim()) {
+      const { data: referrer } = await supabase.from("users").select("id, referral_code").eq("referral_code", referralCode.trim().toUpperCase()).maybeSingle();
+      if (!referrer) {
+        return res.status(400).json({ error: "That referral code doesn't match any account. Double-check it, or leave it blank to sign up without one." });
+      }
+      referredBy = referrer.referral_code;
+    }
+
+    const newUserId = crypto.randomUUID();
     const user = await db.createUser({
-      id:               crypto.randomUUID(),
+      id:               newUserId,
       name,
       email:            email.toLowerCase(),
       role,
+      phone:            phone || null,
       company:          company || null,
       equipment_type:   equipmentType || null,
       truck_desc:       truckDesc || null,
@@ -399,6 +413,10 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
       current_zip:      currentZip || null,
       ratings:          [],
       suspended:        false,
+      // Each user's own referral code, for them to share — short, unique,
+      // and readable enough to say out loud or type in easily.
+      referral_code:    newUserId.slice(0, 8).toUpperCase(),
+      referred_by:      referredBy,
       created_at:       new Date().toISOString(),
     });
 
@@ -597,6 +615,7 @@ const LOAD_FIELD_MAP = {
   contactName: "contact_name", contactPhone: "contact_phone",
   pickupDate: "pickup_date", deliveryDate: "delivery_date",
   pickupTimeEarliest: "pickup_time_earliest", pickupTimeLatest: "pickup_time_latest",
+  directions: "directions", pickupNumber: "pickup_number",
   deliveryTimeEarliest: "delivery_time_earliest", deliveryTimeLatest: "delivery_time_latest",
   hazmatClass: "hazmat_class", freightCondition: "freight_condition",
   linearFeet: "linear_feet", permitRequired: "permit_required",
@@ -637,6 +656,7 @@ const LOAD_VALID_COLUMNS = new Set([
   "miles", "weight", "price", "description", "dims", "equipment_type",
   "hazmat", "ltl", "tarp", "chains", "securement", "securement_details", "pickup_date", "delivery_date",
   "pickup_time_earliest", "pickup_time_latest", "delivery_time_earliest", "delivery_time_latest",
+  "directions", "pickup_number",
   "requirements", "bids", "progress", "paid", "paid_at", "quick_pay", "bol_number",
   "ratecon_sent", "delivery_status_confirmed", "posted_at", "updated_at", "delivered_at", "picked_up_at",
   "commodity", "qty", "freight_condition", "pallets", "linear_feet", "oversize",
@@ -846,6 +866,54 @@ app.delete("/api/feedback/:id", requireOperatorAuth, async (req, res) => {
     const { error } = await supabase.from("reviews").delete().eq("id", req.params.id);
     if (error) throw error;
     res.json({ deleted: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// VERIFICATION FLAGS — a real, persistent record of every carrier
+// verification issue, so an operator can see this in the dashboard
+// itself, not only via an email that could get missed or filtered.
+// ================================================================
+
+// POST /api/verification-flags — open, since this fires during signup
+// before an account (and thus a session) necessarily exists yet.
+app.post("/api/verification-flags", async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("verification_flags").insert({
+      carrier_name: req.body.carrierName || null,
+      carrier_email: req.body.carrierEmail || null,
+      flag_type: req.body.flagType,
+      severity: req.body.severity || "warning",
+      details: req.body.details || null,
+    }).select().single();
+    if (error) throw error;
+    res.json({ flag: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/verification-flags — operator only
+app.get("/api/verification-flags", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("verification_flags")
+      .select("*").order("created_at", { ascending: false }).limit(200);
+    if (error) throw error;
+    res.json({ flags: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/verification-flags/:id — operator only, marking as reviewed
+app.patch("/api/verification-flags/:id", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("verification_flags")
+      .update({ reviewed: req.body.reviewed }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ flag: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1821,8 +1889,14 @@ app.post("/api/waitlist", async (req, res) => {
 // GET /api/waitlist/count
 app.get("/api/waitlist/count", async (req, res) => {
   try {
+    // Deliberately never exposes the exact signup count, even to someone
+    // calling this endpoint directly rather than going through the UI —
+    // the frontend only ever needs to know which of three states applies
+    // (sold out / almost gone / plenty left), not the real number.
     const { count } = await supabase.from("waitlist").select("*", { count: "exact", head: true });
-    res.json({ count: count || 0, spotsLeft: Math.max(0, WAITLIST_PROMO_LIMIT - (count || 0)) });
+    const spotsLeft = Math.max(0, WAITLIST_PROMO_LIMIT - (count || 0));
+    const status = spotsLeft <= 0 ? "sold_out" : spotsLeft <= 20 ? "almost_gone" : "available";
+    res.json({ status });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2247,6 +2321,40 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
           }, { onConflict: "stripe_invoice_id" });
         } catch (revErr) {
           console.error("Could not record subscription payment:", revErr.message);
+        }
+
+        // Referral reward — deliberately placed here, on the first REAL
+        // payment, not at signup or checkout completion. Applying it any
+        // earlier (while the person is still in their free trial) would let
+        // someone refer a friend, get the reward immediately, and have that
+        // friend cancel before ever actually paying anything — this waits
+        // for genuine, confirmed revenue before rewarding anyone.
+        try {
+          const referredUserId = subscription?.metadata?.userId;
+          if (referredUserId) {
+            const { data: referredUser } = await supabase.from("users")
+              .select("id, referred_by, referral_reward_applied").eq("id", referredUserId).single();
+            if (referredUser?.referred_by && !referredUser.referral_reward_applied) {
+              const { data: referrer } = await supabase.from("users")
+                .select("id, name, email, billing").eq("referral_code", referredUser.referred_by).maybeSingle();
+              const referrerCustomerId = referrer?.billing?.stripeCustomerId;
+              if (referrerCustomerId) {
+                // Credits the referrer's Stripe balance for the amount of
+                // THIS invoice — a genuine free month, automatically applied
+                // against their own next real charge, not a manual coupon
+                // someone has to remember to redeem.
+                await stripe.customers.createBalanceTransaction(referrerCustomerId, {
+                  amount: -invoice.amount_paid,
+                  currency: invoice.currency,
+                  description: `Referral reward — ${referredUser.id} completed their first payment`,
+                });
+                await supabase.from("users").update({ referral_reward_applied: true }).eq("id", referredUserId);
+                console.log(`Referral reward applied: ${referrerCustomerId} credited $${(invoice.amount_paid / 100).toFixed(2)} for referring ${referredUserId}`);
+              }
+            }
+          }
+        } catch (refErr) {
+          console.error("Could not apply referral reward:", refErr.message);
         }
         break;
       }
