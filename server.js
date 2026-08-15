@@ -2226,6 +2226,125 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
 // Matches your "sellers collect funds directly" Connect setup — money goes
 // straight to the carrier, this platform never holds it.
 // ================================================================
+// Shared payment release logic — used by both the shipper's manual
+// "release payment" button and the automatic release job below. Kept as
+// one function specifically so there's only ever one real implementation
+// of this money-moving logic to maintain, not two copies that could
+// silently drift apart from each other over time.
+async function releaseLoadPayment({ loadId, amountCents, quickPay, returnTrip, requestingUserId }) {
+  const load = await db.getLoadById(loadId);
+  if (!load) throw new Error("Load not found.");
+  if (requestingUserId && load.shipper_id !== requestingUserId) {
+    const err = new Error("You don't have permission to release payment on this load.");
+    err.status = 403;
+    throw err;
+  }
+  if (!load.carrier_id) {
+    const err = new Error("This load shows no carrier assigned in the database, even if one appears assigned in the app. An operator can fix this directly from the operator dashboard's Loads tab using 'Edit / Fix'.");
+    err.status = 400;
+    throw err;
+  }
+
+  const shipper = await db.getUserById(load.shipper_id);
+  const carrier = await db.getUserById(load.carrier_id);
+  const shipperCustomerId = shipper?.billing?.stripeCustomerId;
+  const carrierStripeAccountId = carrier?.payout?.stripeAccountId;
+  if (!shipperCustomerId) { const e = new Error("No payment method on file for this shipper."); e.status = 400; throw e; }
+  if (!carrierStripeAccountId) { const e = new Error("This carrier hasn't connected a payout account yet."); e.status = 400; throw e; }
+
+  const customer = await stripe.customers.retrieve(shipperCustomerId);
+  const paymentMethodId = customer.invoice_settings?.default_payment_method
+    || (await stripe.paymentMethods.list({ customer: shipperCustomerId, type: "card", limit: 1 })).data[0]?.id;
+  if (!paymentMethodId) { const e = new Error("This shipper has no saved card on file yet — they need to complete a Stripe Checkout session first."); e.status = 400; throw e; }
+
+  const paymentIntent = await stripe.paymentIntents.create({
+    amount: amountCents,
+    currency: "usd",
+    customer: shipperCustomerId,
+    payment_method: paymentMethodId,
+    off_session: true,
+    confirm: true,
+    transfer_data: { destination: carrierStripeAccountId },
+    metadata: { loadId, quickPay: quickPay ? "true" : "false", returnTrip: returnTrip ? "true" : "false" },
+    // With Standard connected accounts, an application_fee_amount can be
+    // added here later if a per-transaction platform fee is ever introduced.
+    // Direct Freight Co currently charges 0% commission on loads.
+  });
+  return paymentIntent;
+}
+
+// ================================================================
+// AUTO-RELEASE — protects carriers from a shipper who simply never
+// clicks "release payment" after a real delivery. Without this, a
+// carrier's only recourse was manually filing a dispute and hoping —
+// there was no actual mechanism forcing money to move at all. This
+// runs periodically and releases payment automatically once a load
+// has been delivered for AUTO_RELEASE_DAYS, unless a dispute was
+// filed on that load before the window closed. A filed dispute always
+// takes priority — this never overrides an active dispute, since
+// disputes are meant to resolve directly between the parties, not be
+// steamrolled by an automatic timer.
+// ================================================================
+const AUTO_RELEASE_DAYS = 5;
+
+async function runAutoReleaseCheck() {
+  if (!stripe) return; // nothing to do if Stripe isn't configured yet
+  try {
+    const cutoff = new Date(Date.now() - AUTO_RELEASE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const { data: candidates, error } = await supabase.from("loads")
+      .select("id, price, carrier_id, delivered_at")
+      .eq("paid", false)
+      .not("delivered_at", "is", null)
+      .lte("delivered_at", cutoff)
+      .neq("status", "cancelled");
+    if (error) throw error;
+    if (!candidates?.length) return;
+
+    for (const load of candidates) {
+      try {
+        // A dispute filed on this load, at any point — even one already
+        // marked resolved — blocks auto-release entirely. Once a human
+        // dispute has been involved in a load, payment release on it
+        // should only ever happen through a deliberate action by the
+        // shipper or an operator, never by an automatic timer that has
+        // no way to know whether "resolved" actually means paid.
+        const { data: disputes } = await supabase.from("disputes")
+          .select("id").eq("load_id", load.id);
+        if (disputes?.length) continue;
+
+        if (!load.carrier_id || !load.price) continue;
+
+        const paymentIntent = await releaseLoadPayment({
+          loadId: load.id,
+          amountCents: Math.round(load.price * 100),
+        });
+
+        await supabase.from("loads").update({
+          paid: true,
+          paid_at: new Date().toISOString(),
+          auto_released: true,
+        }).eq("id", load.id);
+
+        console.log(`Auto-released payment for load ${load.id} — delivered ${AUTO_RELEASE_DAYS}+ days ago, no dispute filed. PaymentIntent: ${paymentIntent.id}`);
+      } catch (loadErr) {
+        // One load failing (e.g. a carrier's payout account disconnected)
+        // shouldn't stop the rest of the batch from being checked.
+        console.error(`Auto-release failed for load ${load.id}:`, loadErr.message);
+      }
+    }
+  } catch (err) {
+    console.error("Auto-release check failed:", err.message);
+  }
+}
+
+// Runs on a real interval since this is a long-running process, not a
+// one-off script — checks every 6 hours, which is frequent enough that
+// no load sits meaningfully past its actual release window.
+setInterval(runAutoReleaseCheck, 6 * 60 * 60 * 1000);
+// Also run once shortly after server startup, so a redeploy doesn't mean
+// waiting up to 6 hours before the first check happens.
+setTimeout(runAutoReleaseCheck, 60 * 1000);
+
 app.post("/api/stripe/pay-load", requireUserAuth, async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
   const { amountCents, loadId, quickPay, returnTrip } = req.body;
@@ -2233,61 +2352,11 @@ app.post("/api/stripe/pay-load", requireUserAuth, async (req, res) => {
     return res.status(400).json({ error: "amountCents and loadId are required" });
   }
   try {
-    // This previously had no authentication at all, and worse, trusted
-    // shipperCustomerId and carrierStripeAccountId directly from the
-    // request body — meaning anyone could call this endpoint and redirect
-    // a real charge to any Stripe account they chose, not just the actual
-    // carrier on the actual load. Now the load is looked up server-side,
-    // the requester is verified as the real owning shipper, and both
-    // Stripe IDs are pulled from the real database records — never from
-    // anything the client sent.
-    const load = await db.getLoadById(loadId);
-    if (!load) return res.status(404).json({ error: "Load not found." });
-    if (load.shipper_id !== req.userId) {
-      return res.status(403).json({ error: "You don't have permission to release payment on this load." });
-    }
-    if (!load.carrier_id) {
-      return res.status(400).json({ error: "This load shows no carrier assigned in the database, even if one appears assigned in the app. An operator can fix this directly from the operator dashboard's Loads tab using 'Edit / Fix'." });
-    }
-
-    const shipper = await db.getUserById(req.userId);
-    const carrier = await db.getUserById(load.carrier_id);
-    const shipperCustomerId = shipper?.billing?.stripeCustomerId;
-    const carrierStripeAccountId = carrier?.payout?.stripeAccountId;
-    if (!shipperCustomerId) return res.status(400).json({ error: "No payment method on file for this shipper." });
-    if (!carrierStripeAccountId) return res.status(400).json({ error: "This carrier hasn't connected a payout account yet." });
-
-    // A PaymentIntent isn't charged just by creating it — it has to be
-    // confirmed with an actual payment method. Since the shipper isn't
-    // actively present at checkout when a load is released (this happens
-    // later, triggered by the shipper clicking a button in the app, not
-    // during Stripe's own checkout flow), we retrieve their saved card from
-    // their subscription checkout and charge it directly (off_session).
-    const customer = await stripe.customers.retrieve(shipperCustomerId);
-    const paymentMethodId = customer.invoice_settings?.default_payment_method
-      || (await stripe.paymentMethods.list({ customer: shipperCustomerId, type: "card", limit: 1 })).data[0]?.id;
-
-    if (!paymentMethodId) {
-      return res.status(400).json({ error: "This shipper has no saved card on file yet — they need to complete a Stripe Checkout session first." });
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: amountCents,
-      currency: "usd",
-      customer: shipperCustomerId,
-      payment_method: paymentMethodId,
-      off_session: true,
-      confirm: true,
-      transfer_data: { destination: carrierStripeAccountId },
-      metadata: { loadId, quickPay: quickPay ? "true" : "false", returnTrip: returnTrip ? "true" : "false" },
-      // With Standard connected accounts, an application_fee_amount can be
-      // added here later if a per-transaction platform fee is ever introduced.
-      // Direct Freight Co currently charges 0% commission on loads.
-    });
+    const paymentIntent = await releaseLoadPayment({ loadId, amountCents, quickPay, returnTrip, requestingUserId: req.userId });
     res.json({ paymentIntentId: paymentIntent.id, status: paymentIntent.status });
   } catch (err) {
     console.error("Load payment error:", err.message);
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
