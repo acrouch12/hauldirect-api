@@ -1938,7 +1938,7 @@ const WAITLIST_PROMO_LIMIT = 100;
 // directly, bypassing the UI entirely, must still be correctly refused the
 // early-bird discount once launched, regardless of how many of the 100
 // spots happened to be claimed before that moment.
-const WAITLIST_PROMO_CUTOFF = new Date("2026-09-01T14:00:00Z"); // matches LAUNCH_DATE in the frontend — update both together
+const WAITLIST_PROMO_CUTOFF = new Date("2026-08-29T14:00:00Z"); // matches LAUNCH_DATE in the frontend — update both together
 const WAITLIST_DISCOUNT    = 20; // 20% off for 3 months
 
 // Generates a random, non-sequential promo code so codes can't be guessed
