@@ -872,6 +872,121 @@ app.delete("/api/feedback/:id", requireOperatorAuth, async (req, res) => {
 });
 
 // ================================================================
+// DISPATCHERS — a real, separate account type that can act on behalf
+// of one or more truckers, but only ever truckers who've explicitly
+// added them. A dispatcher has zero access to anyone who hasn't done
+// this — there's no code to guess, no way to self-link to a carrier.
+// ================================================================
+
+// Reusable check: is this dispatcher genuinely, currently linked to this
+// carrier? Used before letting a dispatcher touch anything on a carrier's
+// behalf — bidding, viewing loads, etc. Never trust a carrierId passed in
+// the request body alone; this is the actual authorization check.
+async function verifyDispatcherLink(dispatcherId, carrierId) {
+  const { data } = await supabase.from("dispatcher_links")
+    .select("id").eq("dispatcher_id", dispatcherId).eq("carrier_id", carrierId).eq("status", "active").maybeSingle();
+  return !!data;
+}
+
+// POST /api/dispatcher/add — a carrier adds a dispatcher by email.
+// Carrier-initiated on purpose: the carrier is the one whose account and
+// money are on the line, so they're the one who should have to take the
+// deliberate step of granting access, not a dispatcher self-adding.
+app.post("/api/dispatcher/add", requireUserAuth, async (req, res) => {
+  try {
+    const carrier = await db.getUserById(req.userId);
+    if (!carrier || (carrier.role !== "trucker" && carrier.role !== "corp")) {
+      return res.status(403).json({ error: "Only carrier accounts can add a dispatcher." });
+    }
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Dispatcher email is required." });
+
+    const dispatcher = await db.getUserByEmail(email);
+    if (!dispatcher) {
+      return res.status(404).json({ error: "No account found with that email. The dispatcher needs to create a Direct Freight Co dispatcher account first." });
+    }
+    if (dispatcher.role !== "dispatcher") {
+      return res.status(400).json({ error: "That email belongs to an account that isn't registered as a dispatcher." });
+    }
+
+    const { data: existing } = await supabase.from("dispatcher_links")
+      .select("id, status").eq("dispatcher_id", dispatcher.id).eq("carrier_id", req.userId).maybeSingle();
+
+    if (existing?.status === "active") {
+      return res.status(409).json({ error: "This dispatcher is already linked to your account." });
+    }
+
+    let link;
+    if (existing) {
+      // Re-adding someone previously revoked — reactivate the same row
+      // rather than creating a duplicate.
+      const { data, error } = await supabase.from("dispatcher_links")
+        .update({ status: "active", added_at: new Date().toISOString(), revoked_at: null })
+        .eq("id", existing.id).select().single();
+      if (error) throw error;
+      link = data;
+    } else {
+      const { data, error } = await supabase.from("dispatcher_links")
+        .insert({ dispatcher_id: dispatcher.id, carrier_id: req.userId }).select().single();
+      if (error) throw error;
+      link = data;
+    }
+    res.json({ link, dispatcherName: dispatcher.name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/dispatcher/revoke — carrier revokes a dispatcher's access.
+// The carrier can always do this unilaterally, immediately — a dispatcher
+// never has a way to prevent or delay their own removal.
+app.patch("/api/dispatcher/revoke", requireUserAuth, async (req, res) => {
+  try {
+    const { dispatcherId } = req.body;
+    const { data, error } = await supabase.from("dispatcher_links")
+      .update({ status: "revoked", revoked_at: new Date().toISOString() })
+      .eq("dispatcher_id", dispatcherId).eq("carrier_id", req.userId).select().single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "No active link found for that dispatcher." });
+    res.json({ revoked: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/dispatcher/my-dispatchers — carrier views who currently has
+// access to act on their behalf.
+app.get("/api/dispatcher/my-dispatchers", requireUserAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("dispatcher_links")
+      .select("id, dispatcher_id, status, added_at, users:dispatcher_id(name, email)")
+      .eq("carrier_id", req.userId).eq("status", "active");
+    if (error) throw error;
+    res.json({ dispatchers: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/dispatcher/my-carriers — dispatcher views which carriers have
+// added them, so they know who they can currently act on behalf of.
+app.get("/api/dispatcher/my-carriers", requireUserAuth, async (req, res) => {
+  try {
+    const dispatcher = await db.getUserById(req.userId);
+    if (!dispatcher || dispatcher.role !== "dispatcher") {
+      return res.status(403).json({ error: "This endpoint is only for dispatcher accounts." });
+    }
+    const { data, error } = await supabase.from("dispatcher_links")
+      .select("id, carrier_id, added_at, users:carrier_id(name, email, equipment_type, mc_number)")
+      .eq("dispatcher_id", req.userId).eq("status", "active");
+    if (error) throw error;
+    res.json({ carriers: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
 // VERIFICATION FLAGS — a real, persistent record of every carrier
 // verification issue, so an operator can see this in the dashboard
 // itself, not only via an email that could get missed or filtered.
@@ -2083,12 +2198,12 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
       }],
       subscription_data: {
         metadata: { userId, planId, billingCycle: billingCycle || "monthly" },
-        // Real, Stripe-enforced trial — until now, the frontend displayed
-        // "30 days free" purely as an estimate, but nothing here actually
-        // told Stripe not to charge immediately, meaning every real
-        // signup was genuinely being charged right away despite the
-        // app's own messaging promising a free trial period.
-        trial_period_days: 30,
+        // Real, Stripe-enforced trial — 60 days (2 months), matching the
+        // launch offer. This is what actually controls when billing
+        // starts; the UI text elsewhere must stay in sync with this
+        // number, since a mismatch here means charging someone before
+        // the date the app itself promised.
+        trial_period_days: 60,
       },
       // Managed Payments is Stripe's international merchant-of-record feature
       // (indirect tax compliance across 80+ countries) — not relevant to a
