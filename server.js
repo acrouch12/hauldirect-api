@@ -1938,7 +1938,7 @@ const WAITLIST_PROMO_LIMIT = 100;
 // directly, bypassing the UI entirely, must still be correctly refused the
 // early-bird discount once launched, regardless of how many of the 100
 // spots happened to be claimed before that moment.
-const WAITLIST_PROMO_CUTOFF = new Date("2026-08-29T14:00:00Z"); // matches LAUNCH_DATE in the frontend — update both together
+const WAITLIST_PROMO_CUTOFF = new Date("2026-09-01T14:00:00Z"); // matches LAUNCH_DATE in the frontend — update both together
 const WAITLIST_DISCOUNT    = 20; // 20% off for 3 months
 
 // Generates a random, non-sequential promo code so codes can't be guessed
@@ -1967,8 +1967,13 @@ app.post("/api/waitlist", async (req, res) => {
     // Get current count for position
     const { count } = await supabase.from("waitlist").select("*", { count: "exact", head: true });
     const position = (count || 0) + 1;
-    const isEarlyBird = position <= WAITLIST_PROMO_LIMIT && Date.now() < WAITLIST_PROMO_CUTOFF.getTime();
-    const promoCode = isEarlyBird ? generatePromoCode(position) : null;
+    // Early-bird discount removed entirely — the waitlist form itself is
+    // no longer part of the public site (replaced with a plain countdown
+    // to the real launch date), so no new promo codes are generated going
+    // forward. Existing codes already issued to earlier signups remain
+    // valid and viewable in the operator dashboard as historical record.
+    const isEarlyBird = false;
+    const promoCode = null;
 
     const { data, error } = await supabase.from("waitlist").insert({
       id:         crypto.randomUUID(),
@@ -2198,6 +2203,11 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
       }],
       subscription_data: {
         metadata: { userId, planId, billingCycle: billingCycle || "monthly" },
+        // Real, Stripe-enforced trial — 60 days (2 months), matching the
+        // launch offer. This is what actually controls when billing
+        // starts; the UI text elsewhere must stay in sync with this
+        // number, since a mismatch here means charging someone before
+        // the date the app itself promised.
         // Real, Stripe-enforced trial — 60 days (2 months), matching the
         // launch offer. This is what actually controls when billing
         // starts; the UI text elsewhere must stay in sync with this
