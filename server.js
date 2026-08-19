@@ -71,6 +71,86 @@ function issueSessionToken(userId) {
   return token;
 }
 
+// Resolves a request's real IP to a rough region/city using a free,
+// no-key IP geolocation lookup. Private/local IPs (dev environment)
+// return nulls rather than a misleading result — they can't be
+// meaningfully geolocated, and treating them as "no prior region" avoids
+// every local test login falsely tripping impossible-travel detection.
+async function geolocateIp(ip) {
+  if (!ip) return { region: null, city: null };
+  const cleanIp = ip.replace("::ffff:", ""); // IPv4-mapped IPv6 addresses
+  if (cleanIp === "::1" || cleanIp.startsWith("127.") || cleanIp.startsWith("10.") || cleanIp.startsWith("192.168.") || cleanIp.startsWith("172.")) {
+    return { region: null, city: null };
+  }
+  try {
+    const res = await fetch(`http://ip-api.com/json/${cleanIp}?fields=status,regionName,city`);
+    const data = await res.json();
+    if (data.status !== "success") return { region: null, city: null };
+    return { region: data.regionName || null, city: data.city || null };
+  } catch (err) {
+    console.warn("IP geolocation failed:", err.message);
+    return { region: null, city: null };
+  }
+}
+
+// Genuinely impossible to travel between US states this fast — this is
+// the actual hard-block threshold. Anything slower than this but still
+// same-day gets logged and flagged for an operator to glance at, not
+// blocked, since real travel legitimately produces different-state
+// logins hours apart.
+const IMPOSSIBLE_TRAVEL_WINDOW_MS = 30 * 60 * 1000;
+const SAME_DAY_FLAG_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Called on every successful login/signup, before a session token is
+// actually issued — records where this login is coming from, and checks
+// it against this account's own most recent login. A genuinely
+// impossible pattern (different state, under 30 minutes) blocks the
+// login outright; a merely unusual one (different state, same day) is
+// logged and flagged for review, never blocked, since real travel
+// produces exactly this pattern too.
+async function recordLoginAndCheckImpossibleTravel(userId, req) {
+  const ip = req.ip || req.connection?.remoteAddress || null;
+  const { region, city } = await geolocateIp(ip);
+
+  let user = null;
+  try { user = await db.getUserById(userId); } catch (err) { /* flag still useful without this */ }
+
+  const { data: priorLogins } = await supabase.from("login_history")
+    .select("region, logged_in_at")
+    .eq("user_id", userId)
+    .order("logged_in_at", { ascending: false })
+    .limit(1);
+
+  const prior = priorLogins?.[0];
+
+  if (prior && region && prior.region && prior.region !== region) {
+    const gapMs = Date.now() - new Date(prior.logged_in_at).getTime();
+    const gapMinutes = Math.round(gapMs / 60000);
+
+    if (gapMs < IMPOSSIBLE_TRAVEL_WINDOW_MS) {
+      await supabase.from("verification_flags").insert({
+        carrier_name: user?.name || null, carrier_email: user?.email || null,
+        flag_type: "impossible_travel_login_blocked", severity: "blocking",
+        details: { userId, priorRegion: prior.region, attemptedRegion: region, gapMinutes },
+      }).catch((err) => console.warn("Could not save verification flag:", err.message));
+      return { blocked: true, priorRegion: prior.region, newRegion: region, gapMinutes };
+    }
+
+    if (gapMs < SAME_DAY_FLAG_WINDOW_MS) {
+      await supabase.from("verification_flags").insert({
+        carrier_name: user?.name || null, carrier_email: user?.email || null,
+        flag_type: "login_location_change", severity: "review",
+        details: { userId, priorRegion: prior.region, newRegion: region, gapMinutes },
+      }).catch((err) => console.warn("Could not save verification flag:", err.message));
+    }
+  }
+
+  await supabase.from("login_history").insert({ user_id: userId, ip_address: ip, region, city })
+    .catch((err) => console.warn("Could not save login history:", err.message));
+
+  return { blocked: false, priorRegion: prior?.region, newRegion: region };
+}
+
 function requireUserAuth(req, res, next) {
   const token = req.headers["x-session-token"];
   if (!token || !sessionTokens[token]) {
@@ -420,6 +500,10 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
       created_at:       new Date().toISOString(),
     });
 
+    // Never blocks here — a brand-new account has no prior login to
+    // compare against — but this establishes the first entry so future
+    // logins have something real to check themselves against.
+    await recordLoginAndCheckImpossibleTravel(user.id, req);
     res.json({ user, sessionToken: issueSessionToken(user.id) });
   } catch (err) {
     console.error("Signup error:", err.message);
@@ -492,6 +576,14 @@ app.post("/api/auth/verify-login-code", loginVerifyLimiter, async (req, res) => 
     const user = await db.getUserByEmail(email);
     if (!user) return res.status(404).json({ error: "No account found with that email." });
     if (user.suspended) return res.status(403).json({ error: "This account has been suspended. Contact support." });
+
+    const travelCheck = await recordLoginAndCheckImpossibleTravel(user.id, req);
+    if (travelCheck.blocked) {
+      return res.status(403).json({
+        error: `This login was blocked — this account just logged in from ${travelCheck.priorRegion} and is now attempting to log in from ${travelCheck.newRegion}, ${travelCheck.gapMinutes} minutes later. That's not physically possible for one person, which usually means this account's login is being shared. Contact support if this is a genuine error.`,
+      });
+    }
+
     res.json({ user, sessionToken: issueSessionToken(user.id) });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -526,11 +618,13 @@ const USER_FIELD_MAP = {
   factoringEnabled: "factoring_enabled", factoringCompany: "factoring_company",
   factoringEmail: "factoring_email", factoringPhone: "factoring_phone",
   factoringNoaNumber: "factoring_noa_number",
+  operatesUnderLeasedAuthority: "operates_under_leased_authority", leaseVerification: "lease_verification",
   // Already valid column names — pass through unchanged
   name: "name", email: "email", role: "role", company: "company", dims: "dims",
   verification: "verification", payout: "payout", billing: "billing", loc: "loc",
   lanes: "lanes", eld: "eld", ratings: "ratings", suspended: "suspended",
   phone: "phone", complimentary: "complimentary", ein: "ein",
+  operates_under_leased_authority: "operates_under_leased_authority", lease_verification: "lease_verification",
 };
 
 const USER_VALID_COLUMNS = new Set([
@@ -541,7 +635,7 @@ const USER_VALID_COLUMNS = new Set([
   "suspended", "created_at", "phone", "complimentary", "complimentary_expiry",
   "ein", "trial_started_at", "address", "billing_cycle", "requested_tier",
   "factoring_enabled", "factoring_company", "factoring_email", "factoring_phone", "factoring_noa_number",
-  "escrow_waiver_accepted",
+  "escrow_waiver_accepted", "operates_under_leased_authority", "lease_verification",
 ]);
 
 function mapUserFields(body) {
@@ -741,14 +835,20 @@ app.patch("/api/loads/:id", requireUserAuth, async (req, res) => {
     const isOwningShipper = existing.shipper_id === req.userId;
     const isAssignedCarrier = existing.carrier_id === req.userId;
     // A carrier claiming a currently-open load (no carrier assigned yet) is
-    // legitimate — but only if they're assigning themselves, not someone else.
-    // This was checking req.body.carrierId, but the frontend has only ever
-    // sent this field as truckerId — meaning this check could never be true,
-    // and every single carrier claim, pickup, and delivery confirmation has
-    // been silently rejected since this check was added, with no visible
-    // error to the person testing it (just a console warning).
+    // legitimate — but only if they're assigning themselves, not someone
+    // else, UNLESS the requester is a dispatcher genuinely linked to the
+    // carrier named in onBehalfOfCarrierId (verified against the real
+    // dispatcher_links table, never trusted from the request alone).
+    // claimedId checks both field names since the frontend has historically
+    // sent this as truckerId, not carrierId — a past version of this check
+    // only looked at carrierId and silently rejected every real claim as a
+    // result. Checking both is what actually keeps this working.
     const claimedId = req.body.truckerId ?? req.body.carrierId;
-    const isClaimingOpenLoad = !existing.carrier_id && claimedId === req.userId;
+    let isClaimingOpenLoad = !existing.carrier_id && claimedId === req.userId;
+    if (!isClaimingOpenLoad && !existing.carrier_id && req.body.onBehalfOfCarrierId) {
+      const linked = await verifyDispatcherLink(req.userId, req.body.onBehalfOfCarrierId);
+      isClaimingOpenLoad = linked && claimedId === req.body.onBehalfOfCarrierId;
+    }
 
     if (!isOwningShipper && !isAssignedCarrier && !isClaimingOpenLoad) {
       return res.status(403).json({ error: "You don't have permission to update this load." });
@@ -778,17 +878,30 @@ app.delete("/api/loads/:id", requireOperatorAuth, async (req, res) => {
 // POST /api/loads/:id/bids
 app.post("/api/loads/:id/bids", requireUserAuth, async (req, res) => {
   try {
-    // carrier_id now forced to the authenticated user, not whatever the
-    // request claimed — without this, anyone logged in could submit a bid
-    // under a different carrier's identity.
+    // carrier_id is forced to the authenticated user by default — without
+    // this, anyone logged in could submit a bid under a different
+    // carrier's identity. The one real exception: a dispatcher acting on
+    // behalf of a carrier who has genuinely added them. That's never
+    // trusted from the request body alone — verifyDispatcherLink checks
+    // the actual dispatcher_links table before the bid is allowed to be
+    // placed under the carrier's identity instead of the dispatcher's own.
+    let carrierId = req.userId;
+    if (req.body.onBehalfOfCarrierId) {
+      const linked = await verifyDispatcherLink(req.userId, req.body.onBehalfOfCarrierId);
+      if (!linked) {
+        return res.status(403).json({ error: "You're not currently linked as a dispatcher for that carrier." });
+      }
+      carrierId = req.body.onBehalfOfCarrierId;
+    }
     const bid = await db.createBid({
       id:         crypto.randomUUID(),
       load_id:    req.params.id,
-      carrier_id: req.userId,
+      carrier_id: carrierId,
       amount:     req.body.amount,
       note:       req.body.note || null,
       status:     "pending",
       created_at: new Date().toISOString(),
+      placed_by_dispatcher_id: req.body.onBehalfOfCarrierId ? req.userId : null,
     });
     res.json({ bid });
   } catch (err) {
@@ -812,13 +925,18 @@ app.patch("/api/bids/:id", requireUserAuth, async (req, res) => {
     // No authentication or ownership check existed here — meaning anyone
     // logged in could accept, reject, or counter any bid on any load, not
     // just their own. Now verifies the requester is either the shipper who
-    // owns the load this bid is on, or the carrier who placed the bid.
+    // owns the load this bid is on, the carrier who placed the bid, or a
+    // dispatcher genuinely linked to that carrier (checked against the
+    // real dispatcher_links table, never trusted from anything the client
+    // claims).
     const { data: bid } = await supabase.from("bids").select("id, load_id, carrier_id").eq("id", req.params.id).single();
     if (!bid) return res.status(404).json({ error: "Bid not found." });
     const load = await db.getLoadById(bid.load_id);
     const isOwningShipper = load && load.shipper_id === req.userId;
     const isBiddingCarrier = bid.carrier_id === req.userId;
-    if (!isOwningShipper && !isBiddingCarrier) {
+    const requester = await db.getUserById(req.userId);
+    const isLinkedDispatcher = requester?.role === "dispatcher" && await verifyDispatcherLink(req.userId, bid.carrier_id);
+    if (!isOwningShipper && !isBiddingCarrier && !isLinkedDispatcher) {
       return res.status(403).json({ error: "You don't have permission to update this bid." });
     }
     const bidResult = await db.updateBid(req.params.id, req.body);
@@ -977,10 +1095,187 @@ app.get("/api/dispatcher/my-carriers", requireUserAuth, async (req, res) => {
       return res.status(403).json({ error: "This endpoint is only for dispatcher accounts." });
     }
     const { data, error } = await supabase.from("dispatcher_links")
-      .select("id, carrier_id, added_at, users:carrier_id(name, email, equipment_type, mc_number)")
+      .select("id, carrier_id, added_at, users:carrier_id(id, name, email, equipment_type, max_weight, mc_number, dot_number, lanes, verification, payout)")
       .eq("dispatcher_id", req.userId).eq("status", "active");
     if (error) throw error;
     res.json({ carriers: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// DRIVERS — a real, separate login for each driver on a Company carrier
+// account, rather than a shared login switching between internal
+// profile records. A driver only ever gets access to a company that has
+// explicitly added them — same authorization model as dispatchers.
+// ================================================================
+
+async function verifyDriverLink(driverId, corpId) {
+  const { data } = await supabase.from("driver_links")
+    .select("id").eq("driver_id", driverId).eq("corp_id", corpId).eq("status", "active").maybeSingle();
+  return !!data;
+}
+
+// POST /api/driver/add — the corp admin adds a driver by email. Same
+// admin-initiated pattern as dispatchers: the account whose authority
+// and insurance are on the line is the one who has to take the
+// deliberate step of granting access.
+app.post("/api/driver/add", requireUserAuth, async (req, res) => {
+  try {
+    const admin = await db.getUserById(req.userId);
+    if (!admin || admin.role !== "corp") {
+      return res.status(403).json({ error: "Only Company accounts can add drivers." });
+    }
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "Driver email is required." });
+
+    const driver = await db.getUserByEmail(email);
+    if (!driver) {
+      return res.status(404).json({ error: "No account found with that email. The driver needs to create a Direct Freight Co driver account first." });
+    }
+    if (driver.role !== "driver") {
+      return res.status(400).json({ error: "That email belongs to an account that isn't registered as a driver." });
+    }
+
+    const { data: existing } = await supabase.from("driver_links")
+      .select("id, status").eq("driver_id", driver.id).eq("corp_id", req.userId).maybeSingle();
+
+    if (existing?.status === "active") {
+      return res.status(409).json({ error: "This driver is already linked to your account." });
+    }
+
+    let link;
+    if (existing) {
+      const { data, error } = await supabase.from("driver_links")
+        .update({ status: "active", added_at: new Date().toISOString(), revoked_at: null })
+        .eq("id", existing.id).select().single();
+      if (error) throw error;
+      link = data;
+    } else {
+      const { data, error } = await supabase.from("driver_links")
+        .insert({ driver_id: driver.id, corp_id: req.userId }).select().single();
+      if (error) throw error;
+      link = data;
+    }
+    res.json({ link, driverName: driver.name });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/driver/revoke — admin revokes a driver's access, immediately
+// and unilaterally, same as dispatcher revocation.
+app.patch("/api/driver/revoke", requireUserAuth, async (req, res) => {
+  try {
+    const { driverId } = req.body;
+    const { data, error } = await supabase.from("driver_links")
+      .update({ status: "revoked", revoked_at: new Date().toISOString() })
+      .eq("driver_id", driverId).eq("corp_id", req.userId).select().single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "No active link found for that driver." });
+    // A revoked driver should no longer show as assigned on any of this
+    // company's loads — clear the assignment rather than leave a
+    // dangling reference to someone who no longer has access.
+    await supabase.from("loads").update({ assigned_driver_id: null })
+      .eq("carrier_id", req.userId).eq("assigned_driver_id", driverId);
+    res.json({ revoked: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/driver/my-drivers — admin views who's currently linked.
+app.get("/api/driver/my-drivers", requireUserAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from("driver_links")
+      .select("id, driver_id, status, added_at, users:driver_id(name, email, phone)")
+      .eq("corp_id", req.userId).eq("status", "active");
+    if (error) throw error;
+    res.json({ drivers: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/driver/my-companies — driver views which companies have
+// added them, so they know who they're linked to.
+app.get("/api/driver/my-companies", requireUserAuth, async (req, res) => {
+  try {
+    const driver = await db.getUserById(req.userId);
+    if (!driver || driver.role !== "driver") {
+      return res.status(403).json({ error: "This endpoint is only for driver accounts." });
+    }
+    const { data, error } = await supabase.from("driver_links")
+      .select("id, corp_id, added_at, users:corp_id(name, company, email)")
+      .eq("driver_id", req.userId).eq("status", "active");
+    if (error) throw error;
+    res.json({ companies: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/driver/my-loads — driver's own assigned loads, the real
+// dashboard content for a driver's own login.
+app.get("/api/driver/my-loads", requireUserAuth, async (req, res) => {
+  try {
+    const driver = await db.getUserById(req.userId);
+    if (!driver || driver.role !== "driver") {
+      return res.status(403).json({ error: "This endpoint is only for driver accounts." });
+    }
+    const { data, error } = await supabase.from("loads")
+      .select("*").eq("assigned_driver_id", req.userId).neq("status", "cancelled")
+      .order("posted_at", { ascending: false });
+    if (error) throw error;
+    res.json({ loads: data || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/loads/:id/assign-driver — admin (or a dispatcher genuinely
+// linked to this carrier) assigns a specific driver to run a load the
+// company has already accepted. Requires the driver to actually be
+// linked to this company — assigning someone who isn't linked would
+// give them visibility into a load with no real authorization behind it.
+app.patch("/api/loads/:id/assign-driver", requireUserAuth, async (req, res) => {
+  try {
+    const load = await db.getLoadById(req.params.id);
+    if (!load) return res.status(404).json({ error: "Load not found." });
+
+    const requester = await db.getUserById(req.userId);
+    // A corp's own login ID may not directly equal load.carrier_id — if
+    // whoever bid/accepted the load had switched to a driver sub-profile
+    // on the frontend at the time, carrier_id could be that sub-profile's
+    // frontend-generated ID instead of the corp's real account ID. Check
+    // both: the corp's own ID directly, and every ID inside their own
+    // stored members list (in `lanes`), before deciding they don't own it.
+    let isOwningCorp = load.carrier_id === req.userId;
+    if (!isOwningCorp && requester?.role === "corp") {
+      const memberIds = Array.isArray(requester.lanes) ? requester.lanes.map((m) => m.id) : [];
+      isOwningCorp = memberIds.includes(load.carrier_id);
+    }
+    const isLinkedDispatcher = requester?.role === "dispatcher" && await verifyDispatcherLink(req.userId, load.carrier_id);
+    if (!isOwningCorp && !isLinkedDispatcher) {
+      return res.status(403).json({ error: "You don't have permission to assign a driver on this load." });
+    }
+
+    const { driverId } = req.body;
+    if (driverId) {
+      // A driver could be linked either to the corp's own top-level ID,
+      // or in principle to whichever ID actually owns the load — check
+      // against the corp's real account ID specifically, since that's
+      // what driver_links are always created against.
+      const corpIdForLinkCheck = requester?.role === "corp" ? req.userId : load.carrier_id;
+      const linked = await verifyDriverLink(driverId, corpIdForLinkCheck);
+      if (!linked) return res.status(400).json({ error: "That driver isn't linked to this company's account." });
+    }
+
+    const { data, error } = await supabase.from("loads")
+      .update({ assigned_driver_id: driverId || null }).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ load: data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -2659,6 +2954,84 @@ app.post("/api/ai-verify-document", async (req, res) => {
     res.json({ raw });
   } catch (err) {
     console.error("AI document verify proxy error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Jo — a real AI chat assistant for platform questions, grounded in the
+// platform's actual current facts (not left to guess or hallucinate).
+// Kept current with real values elsewhere in this file — if pricing,
+// trial length, or detention rate change, this system prompt needs
+// updating too, or Jo starts giving wrong answers confidently.
+const JO_SYSTEM_PROMPT = `You are Jo, the AI assistant for Direct Freight Co — a freight marketplace connecting shippers and carriers directly, with no broker taking a cut. Slogan: "No Brokers · No Cut · No BS."
+
+Answer questions accurately using only the real facts below. If someone asks something you don't have a real answer for, say so honestly and suggest they contact support directly (ashton@directfreightco.com) rather than guessing.
+
+REAL PLATFORM FACTS:
+- Launch date: September 1st, 2026
+- Free trial: 2 months, starting from signup — card is required at signup (so carriers can be paid for real loads), but no subscription fee is charged during the trial
+- Pricing after trial: Carriers $30/mo (or $300/yr, 2 months free), Shippers $70/mo (or $700/yr), Companies from $350/mo depending on team size (Starter 5-10 profiles, Growth 11-50, Fleet 51-150, Enterprise 151-500)
+- Zero commission on any load, ever — the subscription is the only fee
+- No contract — month-to-month, cancel anytime
+- Carrier verification: real DOT/MC and insurance checks against FMCSA, usually completed in minutes. No minimum authority age required — brand new authority is treated the same as an aged one
+- Every bid shown to a shipper displays the carrier's real FMCSA safety rating (Satisfactory/Conditional/Unsatisfactory) and insurance status
+- Real-time GPS tracking runs automatically on every load, pickup to delivery
+- Detention pay: $60/hour, starts accruing automatically after a 2-hour free window at pickup or delivery, no claim needs to be filed
+- Payment: shippers release payment manually, or it auto-releases automatically 5 days after delivery if no dispute has been filed — carriers are never left waiting indefinitely
+- QuickPay: carriers can choose free standard payout (1-2 business days) or instant payout in minutes for a 1.5% fee (Stripe's real cost, not a markup) — instant payout isn't available on every bank/card (~99% qualify; prepaid cards and some smaller banks don't)
+- Leased authority: supported, but only through a Company account — the authority-holding company must add the driver directly and verify them, not a self-signup process
+- Dispatchers: a carrier can add a dispatcher by email from their account settings ("Manage Dispatchers"). A dispatcher can then act on that carrier's behalf — bidding on loads and booking them — once added
+- Company accounts require real proof that a team member has a genuine business relationship with the company (a payroll stub, 1099, or W-2 matching the company's own EIN), and truck drivers additionally need to be a named driver on the company's Certificate of Insurance
+- Disputes are resolved directly between the shipper and carrier — Direct Freight Co doesn't mediate or decide outcomes, and doesn't unilaterally move payment on a disputed load
+
+TONE: Direct, plainspoken, genuinely helpful — matching the brand's honest, no-nonsense voice. Keep answers concise. Never invent numbers, policies, or features not listed above.`;
+
+app.post("/api/chat", async (req, res) => {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) {
+    return res.status(503).json({ error: "ai_not_configured", message: "ANTHROPIC_API_KEY not set on the server yet." });
+  }
+  const { message, history } = req.body;
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "message is required" });
+  }
+  // History is trusted only as prior conversation turns, capped so one
+  // long-running chat can't balloon token usage — the last 12 turns is
+  // plenty of real context for a support-style conversation.
+  const priorTurns = Array.isArray(history) ? history.slice(-12) : [];
+  const messages = [
+    ...priorTurns.filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+      .map((m) => ({ role: m.role, content: m.content })),
+    { role: "user", content: message },
+  ];
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 600,
+        system: JO_SYSTEM_PROMPT,
+        messages,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error("Anthropic API error (chat):", response.status, errText);
+      return res.status(502).json({ error: "anthropic_error", message: "Jo is temporarily unavailable — please try again in a moment." });
+    }
+
+    const data = await response.json();
+    const reply = (data.content || []).map((c) => c.text || "").join("");
+    res.json({ reply });
+  } catch (err) {
+    console.error("Chat proxy error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
