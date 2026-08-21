@@ -65,6 +65,18 @@ function isVerificationBypassActive() {
 const sessionTokens = {}; // { [token]: { userId, expiresAt } }
 const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+// Dispatcher pricing — a flat monthly fee scaled by how many carriers a
+// dispatcher manages, not by loads booked or freight value. Kept as a
+// seat/access fee deliberately, to stay clearly outside broker
+// compensation under 49 U.S.C. 13102, which turns on being paid for
+// arranging a specific transportation transaction.
+const DISPATCHER_TIERS = {
+  solo:     { label: "Solo",     maxCarriers: 1,   priceLabel: "$15/mo" },
+  small:    { label: "Small",    maxCarriers: 5,   priceLabel: "$35/mo" },
+  growing:  { label: "Growing",  maxCarriers: 15,  priceLabel: "$75/mo" },
+  pro:      { label: "Pro",      maxCarriers: Infinity, priceLabel: "$150/mo" },
+};
+
 function issueSessionToken(userId) {
   const token = crypto.randomBytes(32).toString("hex");
   sessionTokens[token] = { userId, expiresAt: Date.now() + SESSION_DURATION_MS };
@@ -188,10 +200,12 @@ function getPlanAmountCents(planId, billingCycle) {
   const MONTHLY = {
     solo_carrier: 3000, solo_shipper: 7000,
     starter: 35000, growth: 80000, fleet: 180000, enterprise: 350000,
+    dispatcher_solo: 1500, dispatcher_small: 3500, dispatcher_growing: 7500, dispatcher_pro: 15000,
   };
   const ANNUAL = {
     solo_carrier: 30000, solo_shipper: 70000,
     starter: 350000, growth: 800000, fleet: 1800000, enterprise: 3500000,
+    dispatcher_solo: 15000, dispatcher_small: 35000, dispatcher_growing: 75000, dispatcher_pro: 150000,
   };
   const table = billingCycle === "annual" ? ANNUAL : MONTHLY;
   return table[planId] || null;
@@ -625,6 +639,7 @@ const USER_FIELD_MAP = {
   lanes: "lanes", eld: "eld", ratings: "ratings", suspended: "suspended",
   phone: "phone", complimentary: "complimentary", ein: "ein",
   operates_under_leased_authority: "operates_under_leased_authority", lease_verification: "lease_verification",
+  dispatcherTier: "dispatcher_tier", dispatcher_tier: "dispatcher_tier",
 };
 
 const USER_VALID_COLUMNS = new Set([
@@ -635,7 +650,7 @@ const USER_VALID_COLUMNS = new Set([
   "suspended", "created_at", "phone", "complimentary", "complimentary_expiry",
   "ein", "trial_started_at", "address", "billing_cycle", "requested_tier",
   "factoring_enabled", "factoring_company", "factoring_email", "factoring_phone", "factoring_noa_number",
-  "escrow_waiver_accepted", "operates_under_leased_authority", "lease_verification",
+  "escrow_waiver_accepted", "operates_under_leased_authority", "lease_verification", "dispatcher_tier",
 ]);
 
 function mapUserFields(body) {
@@ -1032,6 +1047,22 @@ app.post("/api/dispatcher/add", requireUserAuth, async (req, res) => {
 
     if (existing?.status === "active") {
       return res.status(409).json({ error: "This dispatcher is already linked to your account." });
+    }
+
+    // Enforce the dispatcher's own tier limit — checked here, not on the
+    // dispatcher's side, since it's the carrier's add action that would
+    // push them over. A re-activation of a previously revoked link still
+    // counts against the limit the same as a brand new one.
+    if (!existing || existing.status !== "active") {
+      const tier = DISPATCHER_TIERS[dispatcher.dispatcher_tier] || DISPATCHER_TIERS.solo;
+      const { count: activeCount } = await supabase.from("dispatcher_links")
+        .select("*", { count: "exact", head: true })
+        .eq("dispatcher_id", dispatcher.id).eq("status", "active");
+      if ((activeCount || 0) >= tier.maxCarriers) {
+        return res.status(403).json({
+          error: `This dispatcher is already at their plan's limit of ${tier.maxCarriers} carrier${tier.maxCarriers === 1 ? "" : "s"} (${tier.label} plan). They'll need to upgrade their own plan before they can be added by another carrier.`,
+        });
+      }
     }
 
     let link;
@@ -2233,7 +2264,7 @@ const WAITLIST_PROMO_LIMIT = 100;
 // directly, bypassing the UI entirely, must still be correctly refused the
 // early-bird discount once launched, regardless of how many of the 100
 // spots happened to be claimed before that moment.
-const WAITLIST_PROMO_CUTOFF = new Date("2026-09-01T14:00:00Z"); // matches LAUNCH_DATE in the frontend — update both together
+const WAITLIST_PROMO_CUTOFF = new Date("2026-10-01T14:00:00Z"); // matches LAUNCH_DATE in the frontend — update both together
 const WAITLIST_DISCOUNT    = 20; // 20% off for 3 months
 
 // Generates a random, non-sequential promo code so codes can't be guessed
@@ -2502,12 +2533,8 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
         // launch offer. This is what actually controls when billing
         // starts; the UI text elsewhere must stay in sync with this
         // number, since a mismatch here means charging someone before
-        // the date the app itself promised.
-        // Real, Stripe-enforced trial — 60 days (2 months), matching the
-        // launch offer. This is what actually controls when billing
-        // starts; the UI text elsewhere must stay in sync with this
-        // number, since a mismatch here means charging someone before
-        // the date the app itself promised.
+        // the date the app itself promised. Applies to every plan type
+        // uniformly, including dispatcher tiers.
         trial_period_days: 60,
       },
       // Managed Payments is Stripe's international merchant-of-record feature
@@ -2968,7 +2995,7 @@ const JO_SYSTEM_PROMPT = `You are Jo, the AI assistant for Direct Freight Co —
 Answer questions accurately using only the real facts below. If someone asks something you don't have a real answer for, say so honestly and suggest they contact support directly (ashton@directfreightco.com) rather than guessing.
 
 REAL PLATFORM FACTS:
-- Launch date: September 1st, 2026
+- Launch date: October 1st, 2026
 - Free trial: 2 months, starting from signup — card is required at signup (so carriers can be paid for real loads), but no subscription fee is charged during the trial
 - Pricing after trial: Carriers $30/mo (or $300/yr, 2 months free), Shippers $70/mo (or $700/yr), Companies from $350/mo depending on team size (Starter 5-10 profiles, Growth 11-50, Fleet 51-150, Enterprise 151-500)
 - Zero commission on any load, ever — the subscription is the only fee
@@ -2986,7 +3013,49 @@ REAL PLATFORM FACTS:
 
 TONE: Direct, plainspoken, genuinely helpful — matching the brand's honest, no-nonsense voice. Keep answers concise. Never invent numbers, policies, or features not listed above.`;
 
+// Site lock — a real, operator-controlled maintenance mode. Public read
+// (every visitor's browser needs to check this before rendering anything),
+// operator-only write. Lets the operator test the actual live, deployed
+// site without real visitors seeing it mid-test — the operator's own
+// access still works while locked, through the existing hidden PIN-access
+// bypass (Ctrl+Shift+O or ?opaccess=1), which was already built for
+// exactly this kind of "operator gets in regardless" situation.
+app.get("/api/site-status", async (req, res) => {
+  try {
+    const { data } = await supabase.from("site_settings").select("value").eq("key", "site_locked").maybeSingle();
+    res.json({ locked: data?.value === true });
+  } catch (err) {
+    // Fail open, not closed — a database hiccup should never accidentally
+    // lock real visitors out of a live site with no way back in.
+    res.json({ locked: false });
+  }
+});
+
+app.post("/api/site-lock", requireOperatorAuth, async (req, res) => {
+  const { locked } = req.body;
+  if (typeof locked !== "boolean") return res.status(400).json({ error: "locked (boolean) is required" });
+  try {
+    const { error } = await supabase.from("site_settings").upsert({ key: "site_locked", value: locked, updated_at: new Date().toISOString() }, { onConflict: "key" });
+    if (error) throw error;
+    res.json({ locked });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/chat", async (req, res) => {
+  // Jo is intentionally on hold — put here on purpose, not left running
+  // idle. This stops the endpoint before it ever reaches the Anthropic
+  // API, so there's genuinely zero cost risk regardless of how this
+  // endpoint might be reached (the frontend widget is unmounted too, but
+  // this endpoint itself was never behind auth, so this guard matters on
+  // its own). To bring Jo back later: delete this block, then remount
+  // <JoChatWidget /> in ComingSoonScreen, ShipperApp, and TruckerApp.
+  return res.status(503).json({
+    error: "jo_on_hold",
+    message: "Jo isn't available right now — check back once we're further along.",
+  });
+
   const key = process.env.ANTHROPIC_API_KEY;
   if (!key) {
     return res.status(503).json({ error: "ai_not_configured", message: "ANTHROPIC_API_KEY not set on the server yet." });
