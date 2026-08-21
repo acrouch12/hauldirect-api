@@ -140,25 +140,42 @@ async function recordLoginAndCheckImpossibleTravel(userId, req) {
     const gapMinutes = Math.round(gapMs / 60000);
 
     if (gapMs < IMPOSSIBLE_TRAVEL_WINDOW_MS) {
-      await supabase.from("verification_flags").insert({
-        carrier_name: user?.name || null, carrier_email: user?.email || null,
-        flag_type: "impossible_travel_login_blocked", severity: "blocking",
-        details: { userId, priorRegion: prior.region, attemptedRegion: region, gapMinutes },
-      }).catch((err) => console.warn("Could not save verification flag:", err.message));
+      try {
+        await supabase.from("verification_flags").insert({
+          carrier_name: user?.name || null, carrier_email: user?.email || null,
+          flag_type: "impossible_travel_login_blocked", severity: "blocking",
+          details: { userId, priorRegion: prior.region, attemptedRegion: region, gapMinutes },
+        });
+      } catch (err) {
+        // Supabase's query builder is thenable (works with await) but is
+        // not a real Promise instance — chaining .catch() directly onto
+        // it throws "catch is not a function" rather than actually
+        // catching anything. A real try/catch around the awaited call is
+        // the correct fix, and this genuinely ran on every single login,
+        // not just an edge case.
+        console.warn("Could not save verification flag:", err.message);
+      }
       return { blocked: true, priorRegion: prior.region, newRegion: region, gapMinutes };
     }
 
     if (gapMs < SAME_DAY_FLAG_WINDOW_MS) {
-      await supabase.from("verification_flags").insert({
-        carrier_name: user?.name || null, carrier_email: user?.email || null,
-        flag_type: "login_location_change", severity: "review",
-        details: { userId, priorRegion: prior.region, newRegion: region, gapMinutes },
-      }).catch((err) => console.warn("Could not save verification flag:", err.message));
+      try {
+        await supabase.from("verification_flags").insert({
+          carrier_name: user?.name || null, carrier_email: user?.email || null,
+          flag_type: "login_location_change", severity: "review",
+          details: { userId, priorRegion: prior.region, newRegion: region, gapMinutes },
+        });
+      } catch (err) {
+        console.warn("Could not save verification flag:", err.message);
+      }
     }
   }
 
-  await supabase.from("login_history").insert({ user_id: userId, ip_address: ip, region, city })
-    .catch((err) => console.warn("Could not save login history:", err.message));
+  try {
+    await supabase.from("login_history").insert({ user_id: userId, ip_address: ip, region, city });
+  } catch (err) {
+    console.warn("Could not save login history:", err.message);
+  }
 
   return { blocked: false, priorRegion: prior?.region, newRegion: region };
 }
