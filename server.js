@@ -458,7 +458,7 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
     const { name, email, role, company, equipmentType, truckDesc, maxWeight,
             dotNumber, mcNumber, verification, coiVerified, coiData,
             bizVerified, bizData, stripeConnected, payout, billing,
-            loc, dims, lanes, eld, equipmentStatus, currentZip, phone, referralCode } = req.body;
+            loc, dims, lanes, eld, equipmentStatus, currentZip, phone, referralCode, dispatcherTier } = req.body;
 
     if (!name || !email || !role) return res.status(400).json({ error: "name, email, role required" });
 
@@ -524,6 +524,10 @@ app.post("/api/auth/signup", signupLimiter, async (req, res) => {
       current_zip:      currentZip || null,
       ratings:          [],
       suspended:        false,
+      // Only meaningful for dispatcher accounts — explicit null for every
+      // other role rather than letting the column's DB-level 'solo'
+      // default apply to accounts where a dispatcher tier makes no sense.
+      dispatcher_tier:  role === "dispatcher" ? (dispatcherTier || "solo") : null,
       // Each user's own referral code, for them to share — short, unique,
       // and readable enough to say out loud or type in easily.
       referral_code:    newUserId.slice(0, 8).toUpperCase(),
@@ -762,7 +766,7 @@ const LOAD_FIELD_MAP = {
   returnTripRequestedAt: "return_trip_requested_at", returnTripResolvedAt: "return_trip_resolved_at",
   additionalPayFee: "additional_pay_fee",
   bolPackageCount: "bol_package_count", bolPackageType: "bol_package_type", bolSentAt: "bol_sent_at",
-  trackingStartedAt: "tracking_started_at",
+  trackingStartedAt: "tracking_started_at", dispatcherId: "dispatcher_id",
   // Already valid snake_case / single-word column names — pass through unchanged
   origin: "origin", destination: "destination", miles: "miles", weight: "weight",
   price: "price", description: "description", dims: "dims", equipmentType: "equipment_type",
@@ -793,7 +797,7 @@ const LOAD_VALID_COLUMNS = new Set([
   "return_trip_status", "return_trip_reason", "return_trip_fee", "return_trip_note",
   "return_trip_requested_at", "return_trip_resolved_at", "additional_pay_fee",
   "bol_package_count", "bol_package_type", "bol_sent_at",
-  "tracking_started_at",
+  "tracking_started_at", "dispatcher_id",
 ]);
 
 function mapLoadFields(body) {
@@ -1045,8 +1049,11 @@ async function verifyDispatcherLink(dispatcherId, carrierId) {
 app.post("/api/dispatcher/add", requireUserAuth, async (req, res) => {
   try {
     const carrier = await db.getUserById(req.userId);
-    if (!carrier || (carrier.role !== "trucker" && carrier.role !== "corp")) {
-      return res.status(403).json({ error: "Only carrier accounts can add a dispatcher." });
+    // Dispatchers are restricted to Company tier accounts (role === "corp")
+    // — a solo owner-operator ("trucker") dispatches themselves; dispatch
+    // services are for fleets managing multiple trucks/drivers at once.
+    if (!carrier || carrier.role !== "corp") {
+      return res.status(403).json({ error: "Only Company tier accounts can add a dispatcher. Individual carrier accounts dispatch their own loads." });
     }
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: "Dispatcher email is required." });
@@ -2862,27 +2869,38 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
         // someone refer a friend, get the reward immediately, and have that
         // friend cancel before ever actually paying anything — this waits
         // for genuine, confirmed revenue before rewarding anyone.
+        //
+        // Flat reward, not scaled to the referred person's own payment —
+        // deliberately bigger for a shipper referral than a carrier
+        // referral, made explicit rather than left as a quiet side effect
+        // of shippers simply paying more. A referred Company account is
+        // classified the same way the frontend already infers shipping vs.
+        // trucking companies — equipment_type present means trucking.
         try {
           const referredUserId = subscription?.metadata?.userId;
           if (referredUserId) {
             const { data: referredUser } = await supabase.from("users")
-              .select("id, referred_by, referral_reward_applied").eq("id", referredUserId).single();
+              .select("id, role, equipment_type, referred_by, referral_reward_applied").eq("id", referredUserId).single();
             if (referredUser?.referred_by && !referredUser.referral_reward_applied) {
               const { data: referrer } = await supabase.from("users")
                 .select("id, name, email, billing").eq("referral_code", referredUser.referred_by).maybeSingle();
               const referrerCustomerId = referrer?.billing?.stripeCustomerId;
               if (referrerCustomerId) {
-                // Credits the referrer's Stripe balance for the amount of
-                // THIS invoice — a genuine free month, automatically applied
-                // against their own next real charge, not a manual coupon
-                // someone has to remember to redeem.
+                const isShipperSide = referredUser.role === "shipper" || (referredUser.role === "corp" && !referredUser.equipment_type);
+                const REFERRAL_REWARD_SHIPPER_CENTS = 5000; // $50 flat — referring a shipper
+                const REFERRAL_REWARD_CARRIER_CENTS = 2000; // $20 flat — referring a carrier, dispatcher, driver, or trucking company
+                const rewardCents = isShipperSide ? REFERRAL_REWARD_SHIPPER_CENTS : REFERRAL_REWARD_CARRIER_CENTS;
+
+                // Credits the referrer's Stripe balance a flat amount,
+                // automatically applied against their own next real charge —
+                // not a manual coupon someone has to remember to redeem.
                 await stripe.customers.createBalanceTransaction(referrerCustomerId, {
-                  amount: -invoice.amount_paid,
+                  amount: -rewardCents,
                   currency: invoice.currency,
-                  description: `Referral reward — ${referredUser.id} completed their first payment`,
+                  description: `Referral reward — ${referredUser.id} completed their first payment (${isShipperSide ? "shipper" : "carrier"} referral)`,
                 });
                 await supabase.from("users").update({ referral_reward_applied: true }).eq("id", referredUserId);
-                console.log(`Referral reward applied: ${referrerCustomerId} credited $${(invoice.amount_paid / 100).toFixed(2)} for referring ${referredUserId}`);
+                console.log(`Referral reward applied: ${referrerCustomerId} credited $${(rewardCents / 100).toFixed(2)} for referring ${referredUserId} (${isShipperSide ? "shipper" : "carrier"})`);
               }
             }
           }
