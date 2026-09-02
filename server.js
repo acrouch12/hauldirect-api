@@ -1077,7 +1077,12 @@ app.post("/api/dispatcher/add", requireUserAuth, async (req, res) => {
     // dispatcher's side, since it's the carrier's add action that would
     // push them over. A re-activation of a previously revoked link still
     // counts against the limit the same as a brand new one.
-    if (!existing || existing.status !== "active") {
+    // A complimentary dispatcher (granted by an operator, via the same
+    // flag that already bypasses the trial paywall) skips this limit
+    // entirely — a comp account shouldn't still be boxed in at whatever
+    // tier they happen to be stored at.
+    const isComplimentaryActive = dispatcher.complimentary && (!dispatcher.complimentary_expiry || Date.now() < new Date(dispatcher.complimentary_expiry).getTime());
+    if ((!existing || existing.status !== "active") && !isComplimentaryActive) {
       const tier = DISPATCHER_TIERS[dispatcher.dispatcher_tier] || DISPATCHER_TIERS.solo;
       const { count: activeCount } = await supabase.from("dispatcher_links")
         .select("*", { count: "exact", head: true })
