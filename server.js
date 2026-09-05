@@ -1760,6 +1760,60 @@ app.get("/api/operator/page-views", requireOperatorAuth, async (req, res) => {
   }
 });
 
+// GET /api/operator/recurring-visitors — anyone who's shown up more than
+// once, anonymous or logged-in, sorted by whoever's visited the most.
+// A logged-in user coming back is expected — that's just normal app use.
+// An anonymous visitor coming back multiple times before ever signing up
+// is the genuinely interesting signal here: someone who keeps checking
+// the site out but hasn't converted yet, which is worth knowing about
+// even though there's no name attached to reach out to directly.
+app.get("/api/operator/recurring-visitors", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data: views } = await supabase.from("page_views")
+      .select("visitor_id, user_id, created_at")
+      .order("created_at", { ascending: false })
+      .limit(20000);
+
+    // Group anonymous visits by visitor_id, logged-in visits by user_id —
+    // two separate groupings since they mean different things and
+    // shouldn't be merged into one count.
+    const anonGroups = {};
+    const userGroups = {};
+    for (const v of views || []) {
+      if (v.user_id) {
+        if (!userGroups[v.user_id]) userGroups[v.user_id] = { count: 0, first: v.created_at, last: v.created_at };
+        userGroups[v.user_id].count++;
+        if (v.created_at < userGroups[v.user_id].first) userGroups[v.user_id].first = v.created_at;
+        if (v.created_at > userGroups[v.user_id].last) userGroups[v.user_id].last = v.created_at;
+      } else if (v.visitor_id) {
+        if (!anonGroups[v.visitor_id]) anonGroups[v.visitor_id] = { count: 0, first: v.created_at, last: v.created_at };
+        anonGroups[v.visitor_id].count++;
+        if (v.created_at < anonGroups[v.visitor_id].first) anonGroups[v.visitor_id].first = v.created_at;
+        if (v.created_at > anonGroups[v.visitor_id].last) anonGroups[v.visitor_id].last = v.created_at;
+      }
+    }
+
+    const recurringAnonymous = Object.entries(anonGroups)
+      .filter(([, g]) => g.count >= 2)
+      .map(([visitorId, g]) => ({ visitorId, visitCount: g.count, firstSeen: g.first, lastSeen: g.last }))
+      .sort((a, b) => b.visitCount - a.visitCount);
+
+    const recurringUserIds = Object.entries(userGroups).filter(([, g]) => g.count >= 2).map(([userId]) => userId);
+    let recurringUsers = [];
+    if (recurringUserIds.length) {
+      const { data: users } = await supabase.from("users").select("id, name, email, role").in("id", recurringUserIds);
+      recurringUsers = (users || []).map((u) => ({
+        userId: u.id, name: u.name, email: u.email, role: u.role,
+        visitCount: userGroups[u.id].count, firstSeen: userGroups[u.id].first, lastSeen: userGroups[u.id].last,
+      })).sort((a, b) => b.visitCount - a.visitCount);
+    }
+
+    res.json({ recurringAnonymous, recurringUsers });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // Leads (CRM) — prospects who haven't signed up yet
 // ================================================================
