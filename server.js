@@ -1783,7 +1783,7 @@ app.post("/api/leads/submit", async (req, res) => {
   try {
     const { name, email, phone, message, roleInterest } = req.body;
     if (!name || !name.trim()) return res.status(400).json({ error: "A name is required." });
-    if (!email && !phone) return res.status(400).json({ error: "An email or phone number is required so we can follow up." });
+    if (!phone || !phone.trim()) return res.status(400).json({ error: "A phone number is required so we can follow up." });
 
     const { data: lead, error } = await supabase.from("leads").insert({
       name: name.trim(),
