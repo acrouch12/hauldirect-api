@@ -1698,6 +1698,147 @@ app.get("/api/operator/users", requireOperatorAuth, async (req, res) => {
   }
 });
 
+// ================================================================
+// Page view tracking — no auth required, since anonymous visitors are
+// exactly what this is meant to capture. Rate-limited separately from
+// everything else since it's a public, unauthenticated write endpoint.
+// ================================================================
+app.post("/api/track/view", async (req, res) => {
+  try {
+    const { visitorId, userId, path, referrer } = req.body;
+    if (!visitorId) return res.status(400).json({ error: "visitorId is required." });
+    await supabase.from("page_views").insert({
+      visitor_id: visitorId,
+      user_id: userId || null,
+      path: path || null,
+      referrer: referrer || null,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    // Tracking should never break the app for the visitor it's tracking —
+    // fail silently from their perspective.
+    res.status(200).json({ ok: false });
+  }
+});
+
+// GET /api/operator/page-views — aggregated stats, not raw rows, since an
+// operator dashboard needs "how many" and "trending which way," not a
+// list of every individual hit.
+app.get("/api/operator/page-views", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data: views } = await supabase.from("page_views")
+      .select("visitor_id, user_id, path, created_at")
+      .order("created_at", { ascending: false })
+      .limit(20000); // enough for real trend data without pulling an unbounded table
+
+    const anonymous = (views || []).filter((v) => !v.user_id);
+    const loggedIn = (views || []).filter((v) => !!v.user_id);
+    const uniqueAnonymousVisitors = new Set(anonymous.map((v) => v.visitor_id)).size;
+    const uniqueReturningUsers = new Set(loggedIn.map((v) => v.user_id)).size;
+
+    // Views by day, last 30 days, split the same way the dashboard shows
+    // them — anonymous traffic vs. logged-in return visits.
+    const byDay = {};
+    for (const v of views || []) {
+      const day = (v.created_at || "").slice(0, 10);
+      if (!day) continue;
+      if (!byDay[day]) byDay[day] = { anonymous: 0, loggedIn: 0 };
+      if (v.user_id) byDay[day].loggedIn++; else byDay[day].anonymous++;
+    }
+    const sortedDays = Object.keys(byDay).sort().slice(-30);
+
+    res.json({
+      totalViews: (views || []).length,
+      anonymousViews: anonymous.length,
+      loggedInViews: loggedIn.length,
+      uniqueAnonymousVisitors,
+      uniqueReturningUsers,
+      byDay: sortedDays.map((day) => ({ day, ...byDay[day] })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// Leads (CRM) — prospects who haven't signed up yet
+// ================================================================
+app.get("/api/operator/leads", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data: leads } = await supabase.from("leads").select("*").order("updated_at", { ascending: false });
+    res.json({ leads: leads || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/operator/leads", requireOperatorAuth, async (req, res) => {
+  try {
+    const { name, email, phone, company, roleInterest, source } = req.body;
+    if (!name) return res.status(400).json({ error: "A name is required to add a lead." });
+    const { data: lead, error } = await supabase.from("leads").insert({
+      name, email: email || null, phone: phone || null, company: company || null,
+      role_interest: roleInterest || null, source: source || null,
+    }).select().single();
+    if (error) throw error;
+    res.json({ lead });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.patch("/api/operator/leads/:id", requireOperatorAuth, async (req, res) => {
+  try {
+    const allowed = ["name", "email", "phone", "company", "role_interest", "stage", "source", "converted_user_id"];
+    const patch = {};
+    for (const key of allowed) if (key in req.body) patch[key] = req.body[key];
+    patch.updated_at = new Date().toISOString();
+    const { data: lead, error } = await supabase.from("leads").update(patch).eq("id", req.params.id).select().single();
+    if (error) throw error;
+    res.json({ lead });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete("/api/operator/leads/:id", requireOperatorAuth, async (req, res) => {
+  try {
+    await supabase.from("leads").delete().eq("id", req.params.id);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ================================================================
+// Activity log (CRM) — works for a lead or a real user, same shape
+// ================================================================
+app.get("/api/operator/activity/:entityType/:entityId", requireOperatorAuth, async (req, res) => {
+  try {
+    const { data: activity } = await supabase.from("activity_log")
+      .select("*").eq("entity_type", req.params.entityType).eq("entity_id", req.params.entityId)
+      .order("created_at", { ascending: false });
+    res.json({ activity: activity || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/operator/activity", requireOperatorAuth, async (req, res) => {
+  try {
+    const { entityType, entityId, activityType, content } = req.body;
+    if (!entityType || !entityId) return res.status(400).json({ error: "entityType and entityId are required." });
+    const { data: entry, error } = await supabase.from("activity_log").insert({
+      entity_type: entityType, entity_id: entityId,
+      activity_type: activityType || "note", content: content || null,
+    }).select().single();
+    if (error) throw error;
+    res.json({ activity: entry });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // PATCH /api/operator/users/:id/suspend
 app.patch("/api/operator/users/:id/suspend", requireOperatorAuth, async (req, res) => {
   try {
