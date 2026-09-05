@@ -1726,34 +1726,67 @@ app.post("/api/track/view", async (req, res) => {
 // list of every individual hit.
 app.get("/api/operator/page-views", requireOperatorAuth, async (req, res) => {
   try {
-    const { data: views } = await supabase.from("page_views")
+    const { data: allViews } = await supabase.from("page_views")
       .select("visitor_id, user_id, path, created_at")
       .order("created_at", { ascending: false })
       .limit(20000); // enough for real trend data without pulling an unbounded table
 
-    const anonymous = (views || []).filter((v) => !v.user_id);
-    const loggedIn = (views || []).filter((v) => !!v.user_id);
+    // period/date are both optional — when neither is given, this behaves
+    // exactly as before (all data, last 30 days shown in byDay). When
+    // given, "date" is any day within the requested period — for "week"
+    // and "month" it's used to find which week/month contains that day,
+    // not necessarily the exact start of it.
+    const { period, date } = req.query;
+    let views = allViews || [];
+    let rangeStart = null, rangeEnd = null;
+
+    if (period && date) {
+      const anchor = new Date(date + "T00:00:00");
+      if (period === "day") {
+        rangeStart = new Date(anchor);
+        rangeEnd = new Date(anchor);
+        rangeEnd.setDate(rangeEnd.getDate() + 1);
+      } else if (period === "week") {
+        rangeStart = new Date(anchor);
+        rangeStart.setDate(rangeStart.getDate() - rangeStart.getDay()); // back up to Sunday
+        rangeEnd = new Date(rangeStart);
+        rangeEnd.setDate(rangeEnd.getDate() + 7);
+      } else if (period === "month") {
+        rangeStart = new Date(anchor.getFullYear(), anchor.getMonth(), 1);
+        rangeEnd = new Date(anchor.getFullYear(), anchor.getMonth() + 1, 1);
+      }
+      if (rangeStart && rangeEnd) {
+        views = views.filter((v) => {
+          const t = new Date(v.created_at).getTime();
+          return t >= rangeStart.getTime() && t < rangeEnd.getTime();
+        });
+      }
+    }
+
+    const anonymous = views.filter((v) => !v.user_id);
+    const loggedIn = views.filter((v) => !!v.user_id);
     const uniqueAnonymousVisitors = new Set(anonymous.map((v) => v.visitor_id)).size;
     const uniqueReturningUsers = new Set(loggedIn.map((v) => v.user_id)).size;
 
-    // Views by day, last 30 days, split the same way the dashboard shows
-    // them — anonymous traffic vs. logged-in return visits.
+    // Views by day within whatever range applies — the full 30-day
+    // window by default, or just the requested day/week/month.
     const byDay = {};
-    for (const v of views || []) {
+    for (const v of views) {
       const day = (v.created_at || "").slice(0, 10);
       if (!day) continue;
       if (!byDay[day]) byDay[day] = { anonymous: 0, loggedIn: 0 };
       if (v.user_id) byDay[day].loggedIn++; else byDay[day].anonymous++;
     }
-    const sortedDays = Object.keys(byDay).sort().slice(-30);
+    const sortedDays = Object.keys(byDay).sort();
+    const dayEntries = (period && date) ? sortedDays : sortedDays.slice(-30);
 
     res.json({
-      totalViews: (views || []).length,
+      totalViews: views.length,
       anonymousViews: anonymous.length,
       loggedInViews: loggedIn.length,
       uniqueAnonymousVisitors,
       uniqueReturningUsers,
-      byDay: sortedDays.map((day) => ({ day, ...byDay[day] })),
+      byDay: dayEntries.map((day) => ({ day, ...byDay[day] })),
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
