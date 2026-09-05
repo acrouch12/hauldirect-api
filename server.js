@@ -1772,6 +1772,41 @@ app.get("/api/operator/leads", requireOperatorAuth, async (req, res) => {
   }
 });
 
+// POST /api/leads/submit — public, no auth. For a visitor who isn't ready
+// to create a full account yet but wants a real person to follow up.
+// Lands in the exact same pipeline an operator sees when they add a lead
+// manually — same stages, same activity log — just self-submitted instead
+// of typed in by hand. Any message they leave becomes the first activity
+// entry on the lead, so their own words are the first thing an operator
+// sees, not lost.
+app.post("/api/leads/submit", async (req, res) => {
+  try {
+    const { name, email, phone, message, roleInterest } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: "A name is required." });
+    if (!email && !phone) return res.status(400).json({ error: "An email or phone number is required so we can follow up." });
+
+    const { data: lead, error } = await supabase.from("leads").insert({
+      name: name.trim(),
+      email: email?.trim() || null,
+      phone: phone?.trim() || null,
+      role_interest: roleInterest || null,
+      source: "website",
+    }).select().single();
+    if (error) throw error;
+
+    if (message && message.trim()) {
+      await supabase.from("activity_log").insert({
+        entity_type: "lead", entity_id: lead.id,
+        activity_type: "note", content: message.trim(),
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/operator/leads", requireOperatorAuth, async (req, res) => {
   try {
     const { name, email, phone, company, roleInterest, source } = req.body;
