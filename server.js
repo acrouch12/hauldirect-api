@@ -1679,6 +1679,8 @@ app.get("/api/users/directory", async (req, res) => {
       payout: u.payout ? { connected: u.payout.connected, provider: u.payout.provider } : null,
       billing_cycle: u.billing_cycle, requested_tier: u.requested_tier,
       factoring_enabled: u.factoring_enabled, factoring_company: u.factoring_company,
+      mc_number: u.mc_number, dot_number: u.dot_number, verification: u.verification,
+      coi_verified: u.coi_verified, biz_verified: u.biz_verified,
     }));
     res.json({ users: safe });
   } catch (err) {
