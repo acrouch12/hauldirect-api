@@ -720,6 +720,26 @@ app.patch("/api/auth/user/:id", async (req, res) => {
         return res.status(403).json({ error: `Cannot remove payment method — ${unpaidLoads.length} unpaid load(s) with a carrier assigned. Release payment first.` });
       }
     }
+
+    // Marking an account complimentary only ever hid the in-app paywall —
+    // it never touched a real, already-existing Stripe subscription, which
+    // just kept billing on its own recurring schedule completely unaware
+    // of this flag. A real report of an unexpected charge on an account
+    // that was supposedly complimentary traced back to exactly this: the
+    // two systems were never connected. Being marked complimentary should
+    // genuinely mean no billing at all, not "the app stops asking for
+    // money while Stripe keeps taking it anyway."
+    if (req.body.complimentary === true) {
+      const { data: current } = await supabase.from("users").select("billing").eq("id", req.params.id).single();
+      if (stripe && current?.billing?.stripeSubscriptionId) {
+        try {
+          await stripe.subscriptions.cancel(current.billing.stripeSubscriptionId);
+        } catch (subErr) {
+          console.warn(`Could not cancel Stripe subscription while marking user ${req.params.id} complimentary:`, subErr.message);
+        }
+      }
+    }
+
     const user = await db.updateUser(req.params.id, mapUserFields(req.body));
     res.json({ user });
   } catch (err) {
@@ -2802,6 +2822,18 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
   if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
   const { userId, email, planId, billingCycle, planLabel, returnOrigin } = req.body;
   if (!userId || !email || !planId) return res.status(400).json({ error: "userId, email, and planId are required" });
+
+  // The other half of the complimentary fix above: even with that in
+  // place, nothing stopped a brand new checkout session from being
+  // created for an account that's already complimentary, which would
+  // just recreate the exact same problem going forward. A complimentary
+  // account should never be able to reach real billing at all, not just
+  // get cleaned up after the fact once someone notices a charge.
+  const { data: existingUser } = await supabase.from("users").select("complimentary, complimentary_expiry").eq("id", userId).single();
+  const isActiveComplimentary = existingUser?.complimentary && (!existingUser?.complimentary_expiry || Date.now() < new Date(existingUser.complimentary_expiry).getTime());
+  if (isActiveComplimentary) {
+    return res.status(403).json({ error: "This account is marked complimentary — it shouldn't go through checkout at all. Contact the operator if this needs to change." });
+  }
 
   const amountCents = getPlanAmountCents(planId, billingCycle);
   if (!amountCents) return res.status(400).json({ error: `Unknown plan: ${planId}` });
