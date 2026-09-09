@@ -2047,6 +2047,39 @@ app.delete("/api/operator/users/:id", requireOperatorAuth, async (req, res) => {
   }
 });
 
+// POST /api/operator/refund-charge/:userId — for exactly the situation
+// that prompted this: someone genuinely gets charged by mistake (like the
+// complimentary-account gap this session just found and closed), and an
+// operator needs a real way to undo that specific charge without leaving
+// this app to go dig through the Stripe dashboard by hand. Refunds the
+// customer's single most recent charge — deliberately not "refund
+// everything" or a date range, since the ask here is undoing one mistaken
+// charge, not a general billing-adjustment tool.
+app.post("/api/operator/refund-charge/:userId", requireOperatorAuth, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+
+    const { data: user } = await supabase.from("users").select("name, billing").eq("id", req.params.userId).single();
+    const customerId = user?.billing?.stripeCustomerId;
+    if (!customerId) return res.status(404).json({ error: "This account has no Stripe billing on file — there's no charge to refund." });
+
+    const charges = await stripe.charges.list({ customer: customerId, limit: 1 });
+    const mostRecent = charges.data[0];
+    if (!mostRecent) return res.status(404).json({ error: "No charges found for this customer on Stripe." });
+    if (mostRecent.refunded) return res.status(409).json({ error: `The most recent charge ($${(mostRecent.amount / 100).toFixed(2)}, on ${new Date(mostRecent.created * 1000).toLocaleDateString()}) was already refunded.` });
+
+    const refund = await stripe.refunds.create({ charge: mostRecent.id });
+    res.json({
+      refunded: true,
+      amount: mostRecent.amount / 100,
+      chargeDate: new Date(mostRecent.created * 1000).toISOString(),
+      refundId: refund.id,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // DELETE /api/auth/account — self-service account deletion. Requires a real
 // session token (proving who's asking), and only ever deletes the account
 // belonging to that exact same logged-in user — never someone else's, even
