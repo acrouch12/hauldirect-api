@@ -644,7 +644,7 @@ const USER_FIELD_MAP = {
   equipmentType: "equipment_type", truckDesc: "truck_desc", maxWeight: "max_weight",
   mcNumber: "mc_number", dotNumber: "dot_number", coiVerified: "coi_verified",
   coiData: "coi_data", bizVerified: "biz_verified", bizData: "biz_data",
-  stripeConnected: "stripe_connected", currentZip: "current_zip",
+  stripeConnected: "stripe_connected", currentZip: "current_zip", hazmatEndorsement: "hazmat_endorsement",
   equipmentStatus: "equipment_status", operatorNotes: "operator_notes",
   trialStartedAt: "trial_started_at", createdAt: "created_at",
   complimentaryExpiry: "complimentary_expiry", companyName: "company",
@@ -666,7 +666,7 @@ const USER_FIELD_MAP = {
 const USER_VALID_COLUMNS = new Set([
   "name", "email", "role", "company", "equipment_type", "truck_desc", "max_weight",
   "dims", "dot_number", "mc_number", "verification", "coi_verified", "coi_data",
-  "biz_verified", "biz_data", "stripe_connected", "payout", "billing", "loc",
+  "biz_verified", "biz_data", "stripe_connected", "payout", "billing", "loc", "hazmat_endorsement",
   "lanes", "eld", "equipment_status", "current_zip", "ratings", "operator_notes",
   "suspended", "created_at", "phone", "complimentary", "complimentary_expiry",
   "ein", "trial_started_at", "address", "billing_cycle", "requested_tier",
@@ -949,6 +949,56 @@ app.post("/api/loads/:id/bids", requireUserAuth, async (req, res) => {
       }
       carrierId = req.body.onBehalfOfCarrierId;
     }
+
+    // Mirrors the frontend's meetsLoadRequirements check exactly — that
+    // check already disables the bid button in the UI, but a disabled
+    // button is not real enforcement on its own, since nothing stops a
+    // bid submitted directly against this endpoint from skipping it
+    // entirely. A hazmat load a carrier isn't endorsed for, or a load
+    // that needs equipment/capacity they don't have, has to be blocked
+    // here too, not just hidden from them in the app.
+    const [load, carrier] = await Promise.all([db.getLoadById(req.params.id), db.getUserById(carrierId)]);
+    if (!load) return res.status(404).json({ error: "Load not found." });
+    if (!carrier) return res.status(404).json({ error: "Carrier account not found." });
+
+    const failed = [];
+    if (load.equipment_type && carrier.equipment_type && load.equipment_type !== carrier.equipment_type) {
+      failed.push(`Requires ${load.equipment_type} — carrier is set up as ${carrier.equipment_type}`);
+    }
+    if (carrier.max_weight && load.weight && load.weight > carrier.max_weight) {
+      failed.push(`Load exceeds carrier's ${carrier.max_weight} lb capacity`);
+    }
+    if (carrier.dims && load.dims) {
+      if (carrier.dims.l && load.dims.l && load.dims.l > carrier.dims.l) failed.push("Freight length exceeds carrier's trailer length");
+      if (carrier.dims.w && load.dims.w && load.dims.w > carrier.dims.w) failed.push("Freight width exceeds carrier's trailer width");
+      if (carrier.dims.h && load.dims.h && load.dims.h > carrier.dims.h) failed.push("Freight height exceeds carrier's trailer height");
+    }
+    if (!carrier.payout?.connected) {
+      failed.push("Carrier has not connected a payout account");
+    }
+    if (load.hazmat && !carrier.hazmat_endorsement) {
+      failed.push("This load requires a hazmat endorsement, which this carrier's profile does not have on file");
+    }
+    const req_ = load.requirements;
+    if (req_) {
+      const verification = carrier.verification || null;
+      const safetyRating = verification?.safetyRating || null;
+      const mcVerified = verification?.authorityStatus === "AUTHORIZED";
+      const avgRating = (carrier.ratings && carrier.ratings.length) ? carrier.ratings.reduce((a, b) => a + b, 0) / carrier.ratings.length : 0;
+      if (req_.minSafetyRating && req_.minSafetyRating !== "any") {
+        const ok =
+          req_.minSafetyRating === "not_unsatisfactory" ? safetyRating !== "UNSATISFACTORY" :
+          req_.minSafetyRating === "satisfactory_or_not_rated" ? ["SATISFACTORY", "NOT RATED"].includes(safetyRating) :
+          req_.minSafetyRating === "satisfactory_only" ? safetyRating === "SATISFACTORY" : true;
+        if (!ok) failed.push("Carrier does not meet this load's minimum safety rating requirement");
+      }
+      if (req_.requireMcVerified && !mcVerified) failed.push("MC Verified status required");
+      if (req_.minCarrierRating && avgRating < req_.minCarrierRating) failed.push(`${req_.minCarrierRating}+ star rating required`);
+    }
+    if (failed.length) {
+      return res.status(403).json({ error: "This carrier doesn't meet the load's requirements.", details: failed });
+    }
+
     const bid = await db.createBid({
       id:         crypto.randomUUID(),
       load_id:    req.params.id,
@@ -1699,7 +1749,7 @@ app.get("/api/users/directory", async (req, res) => {
       payout: u.payout ? { connected: u.payout.connected, provider: u.payout.provider } : null,
       billing_cycle: u.billing_cycle, requested_tier: u.requested_tier,
       factoring_enabled: u.factoring_enabled, factoring_company: u.factoring_company,
-      mc_number: u.mc_number, dot_number: u.dot_number, verification: u.verification,
+      mc_number: u.mc_number, dot_number: u.dot_number, verification: u.verification, hazmat_endorsement: u.hazmat_endorsement,
       coi_verified: u.coi_verified, biz_verified: u.biz_verified,
     }));
     res.json({ users: safe });
@@ -1790,6 +1840,22 @@ app.get("/api/operator/page-views", requireOperatorAuth, async (req, res) => {
     const uniqueAnonymousVisitors = new Set(anonymous.map((v) => v.visitor_id)).size;
     const uniqueReturningUsers = new Set(loggedIn.map((v) => v.user_id)).size;
 
+    // "New" means this browser's very first visit ever falls inside the
+    // currently selected window — not just "visited during this window,"
+    // which uniqueAnonymousVisitors above already covers. This needs each
+    // visitor's true first-ever timestamp across the full, unfiltered
+    // page_views history, then checks how many of those first-ever dates
+    // land inside whatever range is currently in view.
+    const firstSeenByVisitor = {};
+    for (const v of allViews || []) {
+      if (v.user_id) continue; // "new" is specifically about anonymous visitors, same as uniqueAnonymousVisitors
+      const t = new Date(v.created_at).getTime();
+      if (!firstSeenByVisitor[v.visitor_id] || t < firstSeenByVisitor[v.visitor_id]) firstSeenByVisitor[v.visitor_id] = t;
+    }
+    const windowStart = rangeStart ? rangeStart.getTime() : (Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const windowEnd = rangeEnd ? rangeEnd.getTime() : Date.now();
+    const newVisitors = Object.values(firstSeenByVisitor).filter((t) => t >= windowStart && t < windowEnd).length;
+
     // Views by day within whatever range applies — the full 30-day
     // window by default, or just the requested day/week/month.
     const byDay = {};
@@ -1808,6 +1874,7 @@ app.get("/api/operator/page-views", requireOperatorAuth, async (req, res) => {
       loggedInViews: loggedIn.length,
       uniqueAnonymousVisitors,
       uniqueReturningUsers,
+      newVisitors,
       byDay: dayEntries.map((day) => ({ day, ...byDay[day] })),
     });
   } catch (err) {
@@ -2922,7 +2989,7 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
 // one function specifically so there's only ever one real implementation
 // of this money-moving logic to maintain, not two copies that could
 // silently drift apart from each other over time.
-async function releaseLoadPayment({ loadId, amountCents, quickPay, returnTrip, requestingUserId }) {
+async function releaseLoadPayment({ loadId, amountCents, quickPay, returnTrip, tonu, requestingUserId }) {
   const load = await db.getLoadById(loadId);
   if (!load) throw new Error("Load not found.");
   if (requestingUserId && load.shipper_id !== requestingUserId) {
@@ -2956,7 +3023,7 @@ async function releaseLoadPayment({ loadId, amountCents, quickPay, returnTrip, r
     off_session: true,
     confirm: true,
     transfer_data: { destination: carrierStripeAccountId },
-    metadata: { loadId, quickPay: quickPay ? "true" : "false", returnTrip: returnTrip ? "true" : "false" },
+    metadata: { loadId, quickPay: quickPay ? "true" : "false", returnTrip: returnTrip ? "true" : "false", tonu: tonu ? "true" : "false" },
     // With Standard connected accounts, an application_fee_amount can be
     // added here later if a per-transaction platform fee is ever introduced.
     // Direct Freight Co currently charges 0% commission on loads.
@@ -3047,6 +3114,32 @@ app.post("/api/stripe/pay-load", requireUserAuth, async (req, res) => {
     res.json({ paymentIntentId: paymentIntent.id, status: paymentIntent.status });
   } catch (err) {
     console.error("Load payment error:", err.message);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// TONU (Truck Ordered Not Used) — a shipper-initiated, shipper-chosen
+// payment to the carrier for a load that was cancelled after a carrier
+// had already committed time to it. Reuses the exact same payment
+// mechanism as a normal load payout — same Stripe transfer to the
+// carrier's connected account — the only difference is the amount is
+// whatever the shipper decides to send, not the load's original price.
+// Once it lands in the carrier's Stripe balance, they choose separately,
+// through the same QuickPay flow used for every other payout, whether to
+// pull it instantly or let it arrive on the standard schedule — the
+// shipper never makes that choice on the carrier's behalf.
+app.post("/api/stripe/send-tonu", requireUserAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+  const { loadId, amountCents } = req.body;
+  if (!loadId || !amountCents || amountCents <= 0) {
+    return res.status(400).json({ error: "loadId and a positive amountCents are required" });
+  }
+  try {
+    const paymentIntent = await releaseLoadPayment({ loadId, amountCents, quickPay: false, tonu: true, requestingUserId: req.userId });
+    await db.updateLoad(loadId, { tonu_paid: true, tonu_amount: amountCents / 100, paid: true });
+    res.json({ paymentIntentId: paymentIntent.id, status: paymentIntent.status });
+  } catch (err) {
+    console.error("TONU payment error:", err.message);
     res.status(err.status || 500).json({ error: err.message });
   }
 });
