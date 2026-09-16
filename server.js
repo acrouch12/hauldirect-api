@@ -22,6 +22,18 @@ if (process.env.NODE_ENV !== "production") require("dotenv").config();
 // Stripe — real payment processing. Requires STRIPE_SECRET_KEY (and later
 // STRIPE_WEBHOOK_SECRET, STRIPE_CONNECT_CLIENT_ID) set in Railway → Variables.
 const stripe = process.env.STRIPE_SECRET_KEY ? require("stripe")(process.env.STRIPE_SECRET_KEY.trim()) : null;
+
+// ── FREE MODE ────────────────────────────────────────────────────────
+// Mirrors FREE_MODE_ACTIVE in haulboard.jsx. The frontend flag alone only
+// hides the paywall UI — it can't stop Stripe itself from auto-charging
+// a subscription that's already trialing. This flag controls the actual
+// trial length Stripe enforces on new checkouts, so a real charge can't
+// happen independent of what the app displays. IMPORTANT: Stripe's trial
+// length has a hard maximum of 730 days (2 years) — there's no way to
+// make a Checkout trial truly infinite. Setting this true buys ~2 years
+// before any of these subscriptions could auto-charge; keep this in sync
+// with the frontend flag, and see PRICING_REFERENCE_before_free_mode.md.
+const FREE_MODE_ACTIVE = true;
 const STRIPE_CONNECT_CLIENT_ID = process.env.STRIPE_CONNECT_CLIENT_ID?.trim() || null; // no longer needed for Express Connect — kept only for backward compatibility
 const API_URL = process.env.API_URL || "https://hauldirect-api-production.up.railway.app"; // this backend's own public URL, used to build Stripe return links
 
@@ -2955,13 +2967,17 @@ app.post("/api/stripe/create-checkout-session", async (req, res) => {
       }],
       subscription_data: {
         metadata: { userId, planId, billingCycle: billingCycle || "monthly" },
-        // Real, Stripe-enforced trial — 60 days (2 months), matching the
-        // launch offer. This is what actually controls when billing
-        // starts; the UI text elsewhere must stay in sync with this
-        // number, since a mismatch here means charging someone before
-        // the date the app itself promised. Applies to every plan type
-        // uniformly, including dispatcher tiers.
-        trial_period_days: 60,
+        // Real, Stripe-enforced trial. Normally 60 days (2 months),
+        // matching the launch offer — this is what actually controls when
+        // billing starts; the UI text elsewhere must stay in sync with
+        // this number, since a mismatch here means charging someone
+        // before the date the app itself promised. Applies to every plan
+        // type uniformly, including dispatcher tiers.
+        // While FREE_MODE_ACTIVE is on, this uses 730 — Stripe's actual
+        // maximum allowed trial length — since Stripe has no way to set
+        // a truly infinite trial. This is not the same as "free forever";
+        // it's the longest delay Stripe's own platform permits.
+        trial_period_days: FREE_MODE_ACTIVE ? 730 : 60,
       },
       // Managed Payments is Stripe's international merchant-of-record feature
       // (indirect tax compliance across 80+ countries) — not relevant to a
@@ -3144,6 +3160,45 @@ app.post("/api/stripe/send-tonu", requireUserAuth, async (req, res) => {
   }
 });
 
+// One-time operator tool: retroactively pauses collection (indefinitely,
+// no resume date) on every existing Stripe subscription in the database,
+// closing the gap for any account that went through real checkout before
+// FREE_MODE_ACTIVE existed or before this pause was added to the
+// checkout webhook. Safe to run more than once — pausing an
+// already-paused subscription is a no-op on Stripe's side. Does not
+// touch subscriptions that don't exist or were already canceled.
+app.post("/api/operator/pause-all-subscriptions", requireOperatorAuth, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: "Stripe not configured on the server yet." });
+  try {
+    const { data: users, error } = await supabase
+      .from("users")
+      .select("id, email, billing")
+      .not("billing->>stripeSubscriptionId", "is", null);
+    if (error) throw error;
+
+    const results = [];
+    for (const user of users) {
+      const subId = user.billing?.stripeSubscriptionId;
+      if (!subId) continue;
+      try {
+        const sub = await stripe.subscriptions.retrieve(subId);
+        if (sub.status === "canceled") {
+          results.push({ userId: user.id, email: user.email, subscriptionId: subId, status: "skipped_canceled" });
+          continue;
+        }
+        await stripe.subscriptions.update(subId, { pause_collection: { behavior: "void" } });
+        results.push({ userId: user.id, email: user.email, subscriptionId: subId, status: "paused" });
+      } catch (subErr) {
+        results.push({ userId: user.id, email: user.email, subscriptionId: subId, status: "error", error: subErr.message });
+      }
+    }
+    res.json({ total: results.length, paused: results.filter(r => r.status === "paused").length, results });
+  } catch (err) {
+    console.error("Bulk pause-all-subscriptions error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ================================================================
 // STRIPE — BILLING PORTAL (real payment method updates, invoice history,
 // and subscription management, all handled by Stripe's own hosted page —
@@ -3268,6 +3323,28 @@ app.post("/api/webhooks/stripe", express.raw({ type: "application/json" }), asyn
             billing: { connected: true, stripeCustomerId: session.customer, stripeSubscriptionId: session.subscription, ...cardDetails },
             trial_started_at: new Date().toISOString(),
           }).eq("id", userId);
+
+          // While FREE_MODE_ACTIVE, pause invoice collection on the new
+          // subscription with no resumes_at date at all — this is the one
+          // genuinely indefinite way to guarantee Stripe never charges it,
+          // unlike trial_period_days, which is capped at 730 days no
+          // matter what. The subscription itself, the card, and the
+          // customer record all still exist normally; only payment
+          // collection is paused. Un-pausing later (when FREE_MODE_ACTIVE
+          // is turned off and normal billing should resume for this
+          // account) requires an explicit stripe.subscriptions.update
+          // call with pause_collection: null — flipping the code flag
+          // alone does not automatically resume any subscription already
+          // paused this way.
+          if (FREE_MODE_ACTIVE && session.subscription) {
+            try {
+              await stripe.subscriptions.update(session.subscription, {
+                pause_collection: { behavior: "void" },
+              });
+            } catch (pauseErr) {
+              console.error(`Could not pause collection on subscription ${session.subscription} for free mode:`, pauseErr.message);
+            }
+          }
         }
         break;
       }
